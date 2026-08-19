@@ -12,6 +12,7 @@ from ptypy.utils import Param
 from ptypy.utils.verbose import logger
 from ptypy import io
 import numpy as np
+from matplotlib import pyplot as plt
 
 @register()
 class ThreePIE(stochastic.EPIE):
@@ -64,6 +65,7 @@ class ThreePIE(stochastic.EPIE):
             comment='The 3PIE reconstruction algorithm',
         )
         self.ptycho.citations.add_article(**self.article)
+        self._has_plotted_first_run = False  # Track if we've saved the first plot
 
     def engine_initialize(self):
         super().engine_initialize()
@@ -133,6 +135,9 @@ class ThreePIE(stochastic.EPIE):
                 # Multislice update
                 error_dct[name] = self.multislice_update(view)
 
+            # --- PLOT AT THE END OF EACH ITERATION ---
+            self._plot_iteration_progress()
+
             self.curiter += 1
 
         return error_dct
@@ -187,6 +192,33 @@ class ThreePIE(stochastic.EPIE):
             pod.object = self._object[-1][pod.ob_view]
             pod.exit = self._exits[-1][pod.pr_view]
 
+            # --- PLOT FIRST RUN THROUGH ---
+            if self.curiter == 0 and not self._has_plotted_first_run:
+                # Retrieve the initial incident probe at z=0
+                initial_probe = self._probe[0][pod.pr_view]
+                
+                fig, axs = plt.subplots(2, 2, figsize=(10, 10))
+                
+                # Plot Initial Probe
+                axs[0, 0].imshow(np.abs(initial_probe), cmap='viridis')
+                axs[0, 0].set_title('Initial Probe Amplitude (ThreePIE)')
+                axs[0, 1].imshow(np.angle(initial_probe), cmap='twilight')
+                axs[0, 1].set_title('Initial Probe Phase (ThreePIE)')
+                
+                # Plot Exit Wave
+                axs[1, 0].imshow(np.abs(pod.exit), cmap='viridis')
+                axs[1, 0].set_title('Exit Wave Amplitude (ThreePIE)')
+                axs[1, 1].imshow(np.angle(pod.exit), cmap='twilight')
+                axs[1, 1].set_title('Exit Wave Phase (ThreePIE)')
+                
+                plt.tight_layout()
+                plt.savefig('threepie_first_run_probe_and_detector.png')
+                plt.close(fig)
+                
+                logger.info("Saved first run probe and exit wave to 'threepie_first_run_probe_and_detector.png'")
+                self._has_plotted_first_run = True
+            # ------------------------------
+
         # Fourier update
         error = self.fourier_update(view)
 
@@ -228,3 +260,41 @@ class ThreePIE(stochastic.EPIE):
             self.ob *= self._object[i]
 
         return error
+
+    def _plot_iteration_progress(self):
+        """Helper to plot and save probe, first slice, and final slice at the end of an iteration."""
+        try:
+            # Correctly extract data from the container's storages
+            probe_raw = next(iter(self._probe[0].storages.values())).data
+            probe_data = probe_raw[0] if probe_raw.ndim == 3 else probe_raw
+            
+            slice_first_raw = next(iter(self._object[0].storages.values())).data
+            slice_first = slice_first_raw[0] if slice_first_raw.ndim == 3 else slice_first_raw
+            
+            slice_final_raw = next(iter(self._object[-1].storages.values())).data
+            slice_final = slice_final_raw[0] if slice_final_raw.ndim == 3 else slice_final_raw
+
+            fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+            
+            # 1. Probe Intensity
+            im0 = axes[0].imshow(np.abs(probe_data)**2, cmap='viridis')
+            axes[0].set_title(f"Probe Intensity (Iter {self.curiter})")
+            fig.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04)
+
+            # 2. First Slice Object Phase
+            im1 = axes[1].imshow(np.angle(slice_first), cmap='gray')
+            axes[1].set_title(f"Slice 0 (First) Phase (Iter {self.curiter})")
+            fig.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04)
+
+            # 3. Final Slice Object Phase
+            im2 = axes[2].imshow(np.angle(slice_final), cmap='gray')
+            axes[2].set_title(f"Slice {self.p.number_of_slices-1} (Final) Phase (Iter {self.curiter})")
+            fig.colorbar(im2, ax=axes[2], fraction=0.046, pad=0.04)
+
+            plt.tight_layout()
+            filename = f"ms_iter_progress_{self.curiter:04d}.png"
+            plt.savefig(filename)
+            plt.close(fig)
+            logger.info(f"Saved iteration progress plot to {filename}")
+        except Exception as e:
+            logger.warning(f"Could not plot iteration progress: {e}")

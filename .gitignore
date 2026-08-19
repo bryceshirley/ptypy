@@ -29,3 +29,7 @@ ghostdriver*
 .ipynb_checkpoints
 .clang-format
 pip-wheel-metadata/
+data/
+data_butterfly/
+result/
+iteration_progress*/

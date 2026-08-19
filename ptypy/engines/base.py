@@ -187,7 +187,8 @@ class BaseEngine(object):
         """
         if storage is None:
             for s in self.pr.storages.values():
-                self.support_contraint(s)
+                self.support_constraint(s)
+            return
 
         # Fourier space
         support = self._probe_fourier_support.get(storage.ID)
