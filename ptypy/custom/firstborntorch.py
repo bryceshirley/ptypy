@@ -1,107 +1,161 @@
-# -*- coding: utf-8 -*-
 """
-First Born multislice engine for ptychography (GPU, PyTorch).
+First Born multislice engine for ptychography.
 
-Same forward model and same update as the CPU engine:
+FORWARD MODEL
+-------------
+    g_j   = O_j - 1                                   (scattering perturbation)
+    phi_j = F^-1[ H_{z_j} F[P] ]                      (unscattered illumination)
+    psi   = P + sum_j F^-1[ H_{-z_j} F[ g_j phi_j ] ] (exit wave)
 
-    phi_j = F^-1[ H_j F[P] ]                        illumination at slice j
-    psi   = c * ( P + sum_j F^-1[ Hbar_j F[ s_j phi_j ] ] )
+with H_{z_j} = exp(2i pi (z_j/lam)(sqrt(1 - (lam f)^2) - 1)) and H_0 = 1, the whole
+model referred to the entrance plane.
 
-with H_0 = 1 and, optionally, O_j = Obar_j (1 + s_j), c = prod_j Obar_j.
+The slices enter as an affine SUM, not an ordered product. Because phi_j
+depends only on the probe, it is computed exactly once per mini-batch.
 
-At batch_size = 1 this reproduces the CPU engine: same denominators, same step
-convention, same modulus projection, one object update per scan position.
-Larger batches accumulate the gradient over several positions before updating,
-which is faster but is a mini-batch method rather than sequential ePIE.
+INVERSION & PRECONDITIONING
+---------------------------
+fw : Forward far-field propagator (sample exit plane -> detector plane)
+bw : Backward far-field propagator (detector plane -> sample exit plane)
+fac : The amplitude projection factor ( sqrt(I_data) / sqrt(I_model) - 1 )
 
-The whole dataset, both object slices and the probe stay resident on the GPU.
-Because phi_j carries no object and the slice sum has no sequential dependency
-in z, the entire slice stack goes through one batched FFT in both the forward
-and the adjoint pass.
+Because the forward map is exactly affine, there is zero object-to-object
+cross-curvature. The per-slice normal operator (A_j^dag A_j) is exactly diagonal,
+reducing to elementwise multiplication by |phi_j|^2 (denoted as K_j in the code).
+
+Updating N slices simultaneously is a Jacobi iteration. The theoretically stable
+step size is alpha < 2/N. The code internally divides by N, so alpha = 1.0 is a
+safe, aggressive default.
+
+THE OVERLAP PROPERTY (WHY THIS WORKS)
+-------------------------------------
+Any higher-order multiple scattering terms neglected by this model involve products
+like g_k * P[g_j * phi_j]. Because the perturbation g = 0 in free space (vacuum),
+these terms vanish completely wherever the illuminated objects on different slices
+do not overlap in the beam path.
+
+Therefore, for sparse samples or layers separated by transverse shifts, this model
+is not an approximation: it is mathematically EXACT to multislice, but computes
+in O(1) depth rather than O(N).
 """
+
 import os
 from datetime import datetime
 
 import numpy as np
-from matplotlib import pyplot as plt
 
-from ptypy.engines import stochastic
-from ptypy.engines import register
+from ptypy import io
+from ptypy import utils as u
+from ptypy.custom import torch_helpers
+from ptypy.custom.engine_hooks import EngineHooks, SliceCorruptionMixin
+from ptypy.engines import register, stochastic
 from ptypy.utils import Param
 from ptypy.utils.verbose import logger
-from ptypy import utils as u
-from ptypy import io
 
 try:
     import torch
-except ImportError:  # pragma: no cover
+except ImportError:
     torch = None
 
 
-# ---------------------------------------------------------------------------#
-#  Numerical extraction of ptypy's far-field propagator                       #
-# ---------------------------------------------------------------------------#
-def _op_call(op, arr):
-    last = None
-    for dt in (np.complex64, np.complex128):
-        try:
-            return np.asarray(op(arr.astype(dt)), dtype=np.complex128)
-        except Exception as e:      # noqa: BLE001
-            last = e
-    raise RuntimeError("could not call propagator: %s" % last)
-
-
-def _apply_numpy(kind, d, w):
-    if kind == 'lsi':
-        return np.fft.ifft2(np.fft.fft2(w) * d['H'])
-    if kind == 'ilsi':
-        return np.fft.fft2(np.fft.ifft2(w) * d['H'])
-    if kind == 'chirp':
-        return d['A'] * np.fft.fft2(d['R'] * w)
-    return d['A'] * np.fft.ifft2(d['R'] * w)
-
-
-def _extract_operator(op, shape, name, rtol=1e-5):
+# ===========================================================================
+#  Pure Mathematical Core (Native PyTorch)
+# ===========================================================================
+def first_born_step(
+    O, P, I_dat, H_fwd, H_rev, ff_fw, ff_bw, mask=None, calc_probe_grad=True
+):
     """
-    Recover a ptypy propagator exactly from two probes, then verify it on random
-    data, so that a convention mismatch is a startup error rather than a wrong
-    reconstruction. Candidates: ifft2(fft2(w) H), fft2(ifft2(w) H),
-    A fft2(R w), A ifft2(R w). numpy convention, which torch matches with the
-    default norm='backward'.
+    Pure mathematical core for First Born Multislice Ptychography.
+
+    Returns raw gradients and preconditioners for external scattering
+    into a global object space (used by ptypy).
+
+    O     : Object slices [N, B, Ny, Nx] or [N, Ny, Nx] (Complex)
+    P     : Probe modes [M, Ny, Nx] (Complex)
+    I_dat : Measured Diffraction Intensity [B, Ny, Nx] or [Ny, Nx] (Real)
+    H_fwd : Forward free-space propagators H_{z_j}  [N, 1, 1, Ny, Nx] (Complex)
+    H_rev : Reverse free-space propagators H_{-z_j} [N, 1, 1, Ny, Nx] (Complex)
     """
-    ny, nx = shape
-    d00 = np.zeros(shape, dtype=np.complex128)
-    d00[0, 0] = 1.0
-    out00 = _op_call(op, d00)
-    out1 = _op_call(op, np.ones(shape, dtype=np.complex128))
+    # Handle single-FOV inputs seamlessly by expanding a dummy batch dimension
+    has_batch = O.ndim == 4
+    if not has_batch:
+        O = O.unsqueeze(1)
+        I_dat = I_dat.unsqueeze(0)
+        if mask is not None:
+            mask = mask.unsqueeze(0)
 
-    cands = [('lsi', {'H': np.fft.fft2(out00)}),
-             ('ilsi', {'H': float(ny * nx) * np.fft.ifft2(out00)})]
-    if np.abs(out00).min() > 0:
-        cands += [('chirp', {'A': out00, 'R': np.fft.ifft2(out1 / out00)}),
-                  ('ichirp', {'A': out00, 'R': np.fft.fft2(out1 / out00)})]
+    # ---------------------------------------------------------
+    # 0. PERTURBATION & ILLUMINATION
+    # ---------------------------------------------------------
+    g = (O - 1.0).unsqueeze(2)  # [N, B, 1, Ny, Nx]
+    P_f = torch.fft.fft2(P).unsqueeze(0)  # [1, M, Ny, Nx]
+    phi = torch.fft.ifft2(H_fwd * P_f)  # [N, 1, M, Ny, Nx]
 
-    rng = np.random.default_rng(0)
-    w = (rng.standard_normal(shape) + 1j * rng.standard_normal(shape)).astype(np.complex128)
-    ref = _op_call(op, w)
-    scale = max(np.abs(ref).max(), 1e-30)
+    # ---------------------------------------------------------
+    # 1. FORWARD PASS
+    # ---------------------------------------------------------
+    scattered_f = torch.fft.fft2(g * phi)
+    psi = P.unsqueeze(0) + torch.fft.ifft2(torch.sum(H_rev * scattered_f, dim=0))
 
-    errs = {k: np.abs(_apply_numpy(k, d, w) - ref).max() / scale for k, d in cands}
-    kind = min(errs, key=errs.get)
-    if errs[kind] > rtol:
-        raise RuntimeError("%s: propagator extraction failed, errors %s"
-                           % (name, {k: '%.2e' % v for k, v in errs.items()}))
+    # ---------------------------------------------------------
+    # 2. DETECTOR PROJECTION
+    # ---------------------------------------------------------
+    F_psi = ff_fw(psi)
 
-    spec = {'kind': kind}
-    spec.update(dict(cands)[kind])
-    logger.info("%s extracted as '%s' (error %.2e)" % (name, kind, errs[kind]))
-    return spec
+    # Use .square() to avoid redundant sqrt inside .abs()
+    I_mod = torch.sum(F_psi.real.square() + F_psi.imag.square(), dim=1)  # [B, Ny, Nx]
+
+    # Single sqrt pass
+    fac = torch.sqrt(I_dat / I_mod.clamp_min(1e-12)) - 1.0
+
+    if mask is not None:
+        fac = torch.where(mask > 0, fac, torch.zeros_like(fac))
+
+    r_field = ff_bw(F_psi * fac.unsqueeze(1))  # [B, M, Ny, Nx]
+
+    # ---------------------------------------------------------
+    # 3. ADJOINT PASS & GRADIENTS
+    # ---------------------------------------------------------
+    r_field_f = torch.fft.fft2(r_field).unsqueeze(0)
+    r_j = torch.fft.ifft2(H_fwd * r_field_f)  # [N, B, M, Ny, Nx]
+
+    grad_g = torch.sum(phi.conj() * r_j, dim=2)  # [N, B, Ny, Nx]
+
+    # Fast exact diagonal normal operator: sum(|phi|^2) without .abs() roots
+    K_O = torch.sum(phi.real.square() + phi.imag.square(), dim=2).squeeze(
+        1
+    )  # [N, Ny, Nx]
+
+    # Probe gradient
+    if calc_probe_grad:
+        grad_P_raw = r_field + torch.fft.ifft2(
+            torch.sum(H_rev * torch.fft.fft2(g.conj() * r_j), dim=0)
+        )
+        grad_P = torch.sum(grad_P_raw, dim=0)  # [M, Ny, Nx]
+        K_P = torch.sum(O.real.square() + O.imag.square(), dim=(0, 1))  # [Ny, Nx]
+    else:
+        grad_P, K_P = None, None
+
+    # Return gradients for global scattering
+    if not has_batch:
+        grad_g = grad_g.squeeze(1)
+        r_field = r_field.squeeze(0)
+        I_mod = I_mod.squeeze(0)
+
+    return grad_g, K_O, grad_P, K_P, r_field, I_mod
 
 
+# ---------------------------------------------------------------------------#
+#  First Born Engine wrapper                                                 #
+# ---------------------------------------------------------------------------#
 @register()
-class FirstBornTorch(stochastic.EPIE):
+class FirstBornTorch(stochastic.EPIE, SliceCorruptionMixin, EngineHooks):
     """
     First Born multislice ptychography on the GPU.
+
+    The corrupt_* parameters and the machinery behind them come from
+    SliceCorruptionMixin, which attaches through the EngineHooks extension
+    points and can be dropped from the bases without touching this class.
 
     Defaults:
 
@@ -127,13 +181,14 @@ class FirstBornTorch(stochastic.EPIE):
     help = Output path for the reconstructed slices
 
     [alpha]
-    default = 0.2
+    default = 1.0
     type = float
     help = Object update step size
-    doc = Divided by number_of_slices internally. Per slice the normal operator
-          A_j^dag A_j = |phi_j|^2 is exactly diagonal, so a full step is correct
-          for one slice alone; updating N slices simultaneously is a Jacobi
-          iteration and needs step < 2/N.
+    doc = Divided by number_of_slices internally. With object_denom = 'local'
+          the preconditioner is the exact diagonal of A^dag A, so the per-slice
+          operator is the identity and the Jacobi bound is alpha < 2. Values
+          near 1 are safe and aggressive; 0.2 is roughly five times slower than
+          it needs to be.
 
     [beta]
     default = 1.0
@@ -141,29 +196,28 @@ class FirstBornTorch(stochastic.EPIE):
     help = Probe update step size
     doc = Divided by number_of_slices internally, as for alpha.
 
+    [probe_update_interval]
+    default = 1
+    type = int
+    help = Batches between probe updates
+    doc = The probe gradient is a quarter of the transforms in a batch and the
+          probe converges long before the object, so 4 costs almost nothing in
+          quality and saves close to 20 percent of the runtime.
+
     [object_denom]
     default = max
     type = str
-    help = Preconditioner: 'max' or 'local'
-    doc = 'max' uses the scalar maximum of the accumulated denominator (ePIE
-          convention, and what reproduces the CPU engine at batch_size = 1).
-          'local' uses the per-pixel accumulated denominator plus denom_reg
-          times its maximum, which is the exact diagonal of A^dag A.
+    help = Preconditioner: 'local' or 'max'
+    doc = 'local' uses the per-pixel accumulated denominator plus denom_reg
+          times its maximum, which is the exact diagonal of A^dag A. 'max' uses
+          the scalar maximum (ePIE convention); at batch_size > 1 that divides
+          everything by the most-overlapped pixel and starves sparsely covered
+          regions, so it is only for reproducing the CPU engine at batch_size 1.
 
     [denom_reg]
     default = 0.01
     type = float
     help = Floor on the 'local' denominator, as a fraction of its maximum
-
-    [mean_field]
-    default = False
-    type = bool
-    help = Expand each slice about its complex mean instead of about vacuum
-
-    [mean_field_relax]
-    default = 0.5
-    type = float
-    help = Relaxation on the Obar update; Obar <- (1-r) Obar + r <O>
 
     [device]
     default = cuda
@@ -171,334 +225,379 @@ class FirstBornTorch(stochastic.EPIE):
     help = Torch device: 'cuda', 'cuda:0' or 'cpu'
 
     [batch_size]
-    default = 32
+    default = 1
     type = int
     help = Scan positions per object update
-    doc = 1 reproduces the CPU engine. Larger values accumulate the gradient
-          over several positions before updating, which is faster but is a
-          mini-batch method rather than sequential ePIE. Peak workspace scales
-          as number_of_slices * batch_size * probe_modes.
+    doc = Peak workspace scales as batch_size * probe_modes. Larger batches
+          use the FFT hardware better but give fewer updates per epoch;
+          32 to 128 is usually the sweet spot.
 
     [precision]
     default = single
     type = str
     help = 'single' (complex64) or 'double' (complex128)
-    doc = Use 'double' to compare against the CPU engine numerically.
+
+    [shuffle]
+    default = False
+    type = bool
+    help = Reshuffle the position order every iteration
+    doc = Set False to walk views in sorted order, as the CPU engine does with
+          its shuffle disabled.
+
+    [seed]
+    default = 0
+    type = int
+    help = Seed for the position order and the object start; 0 leaves them free
+    doc = Set the same non-zero seed for both runs of a paired comparison, and
+          for both engines, so that nothing but the thing under test differs.
+
+    [plot_interval]
+    default = 5
+    type = int
+    help = Iterations between diagnostic PNGs, 0 disables
+    doc = Same name and meaning as in ThreePIETorch, so a paired comparison
+          plots on the same cadence from one setting.
     """
 
     def __init__(self, ptycho_parent, pars=None):
-        super(FirstBornTorch, self).__init__(ptycho_parent, pars)
-        self.article = dict(
-            title='Ptychographic transmission microscopy in three dimensions using a multi-slice approach',
-            author='A. M. Maiden et al.',
-            journal='J. Opt. Soc. Am. A',
-            volume=29, year=2012, page=1606,
-            doi='10.1364/JOSAA.29.001606',
-            comment='The 3PIE reconstruction algorithm',
+        super().__init__(ptycho_parent, pars)
+        self.ptycho.citations.add_article(
+            title="Ptychographic transmission microscopy in three dimensions using a multi-slice approach",
+            author="A. M. Maiden et al.",
+            journal="J. Opt. Soc. Am. A",
+            volume=29,
+            year=2012,
+            page=1606,
+            doi="10.1364/JOSAA.29.001606",
+            comment="The 3PIE reconstruction algorithm",
         )
-        self.ptycho.citations.add_article(**self.article)
-
-        self.plot_progress_dir = f'iteration_progress{datetime.now().strftime("%Y%m%d_%H%M%S")}'
+        # Local time on purpose: this names a run directory the user reads.
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")  # noqa: DTZ005
+        self.plot_progress_dir = f"iteration_progress_{stamp}"
         os.makedirs(self.plot_progress_dir, exist_ok=True)
 
-    # ------------------------------------------------------------------ #
-    #  Setup                                                              #
-    # ------------------------------------------------------------------ #
     def engine_initialize(self):
         super().engine_initialize()
         if torch is None:
             raise ImportError("FirstBornTorch requires PyTorch")
 
         N = self.p.number_of_slices
-
-        dev = str(self.p.device)
-        if dev.startswith('cuda') and not torch.cuda.is_available():
+        want = str(self.p.device)
+        if want.startswith("cuda") and not torch.cuda.is_available():
             logger.warning("CUDA unavailable, falling back to CPU")
-            dev = 'cpu'
-        self.dev = torch.device(dev)
-        dbl = str(self.p.precision).lower().startswith('d')
+            want = "cpu"
+        self.dev = torch.device(want)
+        dbl = str(self.p.precision).lower().startswith("d")
         self.cdt = torch.complex128 if dbl else torch.complex64
         self.rdt = torch.float64 if dbl else torch.float32
 
-        if len(self.ob.storages) != 1 or len(self.pr.storages) != 1:
-            raise NotImplementedError("single object and probe storage only")
-        self._obs = list(self.ob.storages.values())[0]
-        self._prs = list(self.pr.storages.values())[0]
-        if self._obs.data.shape[0] != 1:
-            raise NotImplementedError("single object mode only")
+        self._obs = next(iter(self.ob.storages.values()))
+        self._prs = next(iter(self.pr.storages.values()))
         self.M, self.fny, self.fnx = self._prs.data.shape
 
-        # ptypy containers kept only so the result can be saved
-        self._object = [self.ob.copy(self.ob.ID + "_o_%d" % i) for i in range(N)]
-
-        # object slices, vacuum plus a little noise to break symmetry
-        rng = np.random.default_rng()
+        # Initialize object slices and probe.
+        #
+        # The start is 1 + 1e-3 * uniform, symmetry-broken so the slices are not
+        # degenerate.  It is drawn from self.p.seed rather than from OS entropy:
+        # a paired comparison whose two runs begin from different objects has a
+        # twin-run difference that is not zero at iteration 0, which is usually
+        # the quantity being measured.  seed = 0 leaves the draw free, which is
+        # what the original engine did.
+        self._object = [self.ob.copy(f"{self.ob.ID}_o_{i}") for i in range(N)]
+        seed = int(self.p.seed)
         ob0 = np.ones_like(self._obs.data[0])
-        self.ob_g = torch.stack([
-            torch.as_tensor(ob0 + 1e-3 * ((rng.random(ob0.shape) - 0.5)
-                                          + 1j * (rng.random(ob0.shape) - 0.5)),
-                            dtype=self.cdt, device=self.dev) for _ in range(N)])
-        self.pr_g = torch.as_tensor(np.ascontiguousarray(self._prs.data),
-                                    dtype=self.cdt, device=self.dev)
+        rng = np.random.default_rng(seed if seed else None)
+        self.ob_g = torch.stack(
+            [
+                torch.as_tensor(
+                    ob0
+                    + 1e-3
+                    * (
+                        (rng.random(ob0.shape) - 0.5)
+                        + 1j * (rng.random(ob0.shape) - 0.5)
+                    ),
+                    dtype=self.cdt,
+                    device=self.dev,
+                )
+                for _ in range(N)
+            ]
+        )
+        logger.info(
+            "object start: 1 + 1e-3 noise, seed %s"
+            % (seed if seed else "free (not reproducible)")
+        )
+        self.pr_g = torch.as_tensor(
+            np.ascontiguousarray(self._prs.data), dtype=self.cdt, device=self.dev
+        )
 
-        # slice propagators for j = 1 .. N-1; H_0 = 1 identically and is never
-        # stored or applied, which removes 1/N of the transforms
-        geom = list(self.ptycho.model.scans.values())[0].geometries[0]
-        shape, lam = geom.shape, geom.lam
-        V, W = u.grids(shape, lam / shape / geom.resolution, 'fft')
+        self._order_gen = None
+        if seed:
+            self._order_gen = torch.Generator(device=self.dev)
+            self._order_gen.manual_seed(seed + 1)
+            logger.info(f"seed = {seed}: the position order is reproducible")
+        self.ony, self.onx = self.ob_g.shape[-2:]
+
+        # Precompute Free-Space Propagators (H_z and H_{-z})
+        geom = next(iter(self.ptycho.model.scans.values())).geometries[0]
+        V, W = u.grids(geom.shape, geom.lam / geom.shape[0] / geom.resolution, "fft")
         a2 = V**2 + W**2
+        z_depths = [
+            sum(self.p.slice_thickness[:i])
+            if isinstance(self.p.slice_thickness, (list, tuple))
+            else i * self.p.slice_thickness
+            for i in range(1, N)
+        ]
 
-        th = self.p.slice_thickness
-        z = [sum(th[:i]) for i in range(1, N)] if type(th) in (list, tuple) \
-            else [i * th for i in range(1, N)]
+        # Kept for the corruption block: wavelength and object pixel, which
+        # corrupt_mode = 'defocus' propagates a slice with.
+        self._lam = float(np.ravel(geom.lam)[0])
+        self._dxo = float(np.ravel(geom.resolution)[0])
 
-        H = np.empty((max(N - 1, 1), *shape), dtype=np.complex128)
-        for i, zi in enumerate(z):
-            # clamp the evanescent band so |H| == 1 exactly; referring the model
-            # to the entrance plane by factoring out H^N depends on it
+        H = np.empty((max(N - 1, 1), *geom.shape), dtype=np.complex128)
+        for i, zi in enumerate(z_depths):
             kz = np.sqrt(np.maximum(1.0 - a2, 0.0)) - 1.0
-            Hi = np.exp(2j * np.pi * (zi / lam) * kz)
-            Hi[a2 > 1.0] = 0.0
-            H[i] = Hi
-        self.H = torch.as_tensor(H[:N - 1], dtype=self.cdt, device=self.dev)
-        self.Hb = self.H.conj()
+            H[i] = np.exp(2j * np.pi * (zi / geom.lam) * kz) * (a2 <= 1.0)
+
+        self.H = torch.as_tensor(H[: N - 1], dtype=self.cdt, device=self.dev)
+        self.Hb = self.H.conj().contiguous() if N > 1 else self.H
+
+        # Build fully broadcastable H arrays for pure math function
+        self.H_fwd = torch.ones((N, 1, 1, *geom.shape), dtype=self.cdt, device=self.dev)
+        self.H_rev = torch.ones((N, 1, 1, *geom.shape), dtype=self.cdt, device=self.dev)
+        if N > 1:
+            self.H_fwd[1:, 0, 0] = self.H
+            self.H_rev[1:, 0, 0] = self.Hb
 
         self._build_farfield()
         self._collect_views()
-
-        self._Obar = torch.ones(N, dtype=self.cdt, device=self.dev)
-        self._mf_c = torch.ones((), dtype=self.cdt, device=self.dev)
-
-        # phi depends only on the probe, so it is reused until the probe moves
         self._phi_cache = None
 
-    
+        # Persistent Gradient / Preconditioner Accumulators
+        self._acc_grad = torch.zeros(
+            (N, self.ony, self.onx), dtype=self.cdt, device=self.dev
+        )
+        self._acc_K = torch.zeros(
+            (N, self.ony, self.onx), dtype=self.rdt, device=self.dev
+        )
+
+        self._err = torch.zeros(3, dtype=torch.float64, device=self.dev)
+        self._z0 = torch.zeros((), dtype=self.rdt, device=self.dev)
+        self._nbatch = 0
+        self._pint = max(1, int(self.p.probe_update_interval))
+        self._plot_int = max(0, int(self.p.plot_interval))
+        self._use_max = str(self.p.object_denom).lower().startswith("m")
+
+        self._step = self._batch_update
+
+        self._pad = False
+        self.post_initialize()
 
     def _build_farfield(self):
-        pod = next(list(v.pods.values())[0] for v in self.di.views.values() if v.active)
+        """Extracts fw (forward) and bw (backward) far-field propagators from ptypy."""
+        pod = next(iter(next(iter(self.di.views.values())).pods.values()))
         shape = (self.fny, self.fnx)
-        for tag, spec in (('fw', _extract_operator(pod.fw, shape, "farfield fw")),
-                          ('bw', _extract_operator(pod.bw, shape, "farfield bw"))):
-            g = {'kind': spec['kind']}
-            for k in ('H', 'A', 'R'):
-                if k in spec:
-                    g[k] = torch.as_tensor(spec[k], dtype=self.cdt, device=self.dev)
-            setattr(self, '_ff_' + tag, g)
+        for tag, op in (("fw", pod.fw), ("bw", pod.bw)):
+            spec = torch_helpers.extract_operator(op, shape, f"farfield {tag}")
+            setattr(
+                self, f"_ff_{tag}", torch_helpers.to_torch(spec, self.cdt, self.dev)
+            )
 
     @staticmethod
     def _apply(spec, w):
-        k = spec['kind']
-        if k == 'lsi':
-            return torch.fft.ifft2(torch.fft.fft2(w) * spec['H'])
-        if k == 'ilsi':
-            return torch.fft.fft2(torch.fft.ifft2(w) * spec['H'])
-        if k == 'chirp':
-            return spec['A'] * torch.fft.fft2(spec['R'] * w)
-        return spec['A'] * torch.fft.ifft2(spec['R'] * w)
+        return torch_helpers.apply_torch(spec, w)
 
     def _collect_views(self):
-        """Upload positions, intensities and masks once."""
         names = sorted(n for n, v in self.di.views.items() if v.active)
-        rows, cols, data, masks = [], [], [], []
+        rows, cols, amps, masks = [], [], [], []
+        trivial = True
         for n in names:
-            pods = list(self.di.views[n].pods.values())
-            lo = np.asarray(pods[0].ob_view.dlow, dtype=np.int64)
+            pod = next(iter(self.di.views[n].pods.values()))
+            lo = np.asarray(pod.ob_view.dlow, dtype=np.int64)
             rows.append(np.arange(lo[0], lo[0] + self.fny))
             cols.append(np.arange(lo[1], lo[1] + self.fnx))
-            data.append(np.asarray(self.di.views[n].data, dtype=np.float64))
-            m = pods[0].mask
-            masks.append(np.ones_like(data[-1]) if m is None else np.asarray(m, dtype=np.float64))
+            I = np.asarray(self.di.views[n].data, dtype=np.float64)
+            amps.append(np.sqrt(np.maximum(I, 0.0)))
+            m = (
+                np.ones_like(I, dtype=bool)
+                if pod.mask is None
+                else np.asarray(pod.mask) > 0
+            )
+            trivial = trivial and bool(m.all())
+            masks.append(m)
 
         self.n_pos = len(names)
         self.rows = torch.as_tensor(np.stack(rows), dtype=torch.long, device=self.dev)
         self.cols = torch.as_tensor(np.stack(cols), dtype=torch.long, device=self.dev)
-        self.I = torch.as_tensor(np.stack(data), dtype=self.rdt, device=self.dev)
-        self.mask = torch.as_tensor(np.stack(masks), dtype=self.rdt, device=self.dev)
-        self.amp = torch.sqrt(self.I.clamp_min(0))
+        self.amp_dat = torch.as_tensor(np.stack(amps), dtype=self.rdt, device=self.dev)
+        self.maskb = (
+            None
+            if trivial
+            else torch.as_tensor(np.stack(masks), dtype=torch.bool, device=self.dev)
+        )
+        self.view_names = names
 
-        # illuminated region, so <O_j> is not diluted by the untouched border
-        cov = torch.zeros(self.ob_g[0].shape, dtype=self.rdt, device=self.dev)
+        # Illuminated region.  Any statistic taken over a slice is meaningless
+        # outside it: most of the object array is never touched and stays at
+        # exactly 1, which would drag every rms towards zero by an arbitrary
+        # factor.  Read from outside the engine, by the corruption experiments.
+        cov = torch.zeros((self.ony, self.onx), dtype=self.rdt, device=self.dev)
         for s in range(0, self.n_pos, 256):
             idx = torch.arange(s, min(s + 256, self.n_pos), device=self.dev)
-            self._scatter(cov, idx, torch.ones((idx.numel(), self.fny, self.fnx),
-                                               dtype=self.rdt, device=self.dev))
+            B = idx.numel()
+            self._scatter(
+                cov,
+                self._flat(idx),
+                torch.ones((B, self.fny, self.fnx), dtype=self.rdt, device=self.dev),
+            )
         self.cov = cov > 0
-        frac = float(self.cov.to(self.rdt).mean())
-        logger.info("%d positions, %d probe mode(s), illuminated fraction %.4f"
-                    % (self.n_pos, self.M, frac))
-        if frac < 1e-3:
-            raise RuntimeError("coverage mask empty; check View.dlow indexing")
 
-    # ------------------------------------------------------------------ #
-    #  Gather / scatter                                                   #
-    # ------------------------------------------------------------------ #
-    def _gather(self, arr, idx):
-        return arr[self.rows[idx][:, :, None], self.cols[idx][:, None, :]]
+    def _flat(self, idx):
+        return (
+            self.rows[idx][:, :, None] * self.onx + self.cols[idx][:, None, :]
+        ).reshape(-1)
 
-    def _scatter(self, dst, idx, vals):
-        B = idx.numel()
-        r = self.rows[idx][:, :, None].expand(B, self.fny, self.fnx)
-        c = self.cols[idx][:, None, :].expand(B, self.fny, self.fnx)
-        dst.index_put_((r.reshape(-1), c.reshape(-1)), vals.reshape(-1), accumulate=True)
+    def _gather(self, arr, flat, B):
+        return arr.reshape(-1)[flat].view(B, self.fny, self.fnx)
 
-    # ------------------------------------------------------------------ #
-    #  Mean-field background                                              #
-    # ------------------------------------------------------------------ #
-    def _update_mean_field(self):
-        """Refresh Obar and c once per iteration, before the sweep, so the
-        gradients are exact for the whole sweep."""
-        N = self.p.number_of_slices
-        if not self.p.mean_field:
-            self._Obar = torch.ones(N, dtype=self.cdt, device=self.dev)
-            self._mf_c = torch.ones((), dtype=self.cdt, device=self.dev)
-            return
-
-        r = float(self.p.mean_field_relax)
-        new = torch.stack([self.ob_g[j][self.cov].mean() for j in range(N)])
-        new = torch.where(new.abs() < 1e-6, self._Obar, new)
-        self._Obar = (1.0 - r) * self._Obar + r * new
-        self._mf_c = torch.prod(self._Obar)
-
-    # ------------------------------------------------------------------ #
-    #  Forward, projection, adjoint                                       #
-    # ------------------------------------------------------------------ #
-    def _phi(self):
-        """Unscattered illumination at every slice, (N, M, ny, nx).
-
-        phi_0 = P exactly, since H_0 = 1. Contains no object, so it is neither
-        position- nor batch-dependent and is cached until the probe is updated.
-        """
-        if self._phi_cache is None:
-            N = self.p.number_of_slices
-            ph = torch.empty((N, self.M, self.fny, self.fnx),
-                             dtype=self.cdt, device=self.dev)
-            ph[0] = self.pr_g
-            if N > 1:
-                ph[1:] = torch.fft.ifft2(self.H[:, None] * torch.fft.fft2(self.pr_g))
-            self._phi_cache = (ph, (ph.abs() ** 2).sum(dim=1))
-        return self._phi_cache
+    def _scatter(self, dst, flat, vals):
+        dst.view(-1).index_put_((flat,), vals.reshape(-1), accumulate=True)
 
     def _batch_update(self, idx):
-        N = self.p.number_of_slices
+        """
+        Executes a single mini-batch update: extracts local object patches,
+        computes gradients via the pure mathematical core, tracks convergence
+        errors, and applies the preconditioned Jacobi update.
+        """
         B = idx.numel()
+        flat = self._flat(idx)  # Flattened indices for memory mapping
+
+        # =====================================================================
+        # 1. EXTRACT DATA & PREPARE INPUTS
+        # =====================================================================
+        O_patches = torch.stack(
+            [
+                self._gather(self.ob_g[j], flat, B)
+                for j in range(self.p.number_of_slices)
+            ]
+        )
+        I_dat = self.amp_dat[idx].square()
+        mask = self.maskb[idx].to(self.rdt) if self.maskb is not None else None
+
+        self._nbatch += 1
+        do_probe = (
+            self.curiter >= self.p.probe_update_start and self._nbatch % self._pint == 0
+        )
+
+        # Explicit wrapper functions for the far-field propagators
+        def forward_prop(x):
+            return self._apply(self._ff_fw, x)
+
+        def backward_prop(x):
+            return self._apply(self._ff_bw, x)
+
+        # =====================================================================
+        # 2. RUN PURE MATHEMATICAL CORE
+        # =====================================================================
+        grad_g, K_O, grad_P, K_P, r_field, I_mod = first_born_step(
+            O=O_patches,
+            P=self.pr_g,
+            I_dat=I_dat,
+            H_fwd=self.H_fwd,
+            H_rev=self.H_rev,
+            ff_fw=forward_prop,
+            ff_bw=backward_prop,
+            mask=mask,
+            calc_probe_grad=do_probe,
+        )
+
+        # =====================================================================
+        # 3. CALCULATE CONVERGENCE METRICS (Errors)
+        # =====================================================================
+        amp_mod = I_mod.clamp_min(0).sqrt()
+        amp_dat = self.amp_dat[idx]
+
+        # Unified mask logic to avoid repeated branching
+        m_weight = 1.0 if mask is None else mask
+        m_sum = (
+            float(B * self.fny * self.fnx) if mask is None else mask.sum().clamp_min(1)
+        )
+
+        e0 = (m_weight * (amp_mod - amp_dat).square()).sum() / m_sum
+        e1 = (m_weight * (I_mod - I_dat).square() / (I_dat + 1.0)).sum() / m_sum
+        self._err.add_(torch.stack([e0, e1, r_field.abs().sum()]).to(torch.float64))
+
+        # =====================================================================
+        # 4. SCATTER GRADIENTS & APPLY PRECONDITIONED UPDATE
+        # =====================================================================
+        self._acc_grad.zero_()
+        self._acc_K.zero_()
+
+        # Map the local batch gradients back into the global object array
+        for j in range(self.p.number_of_slices):
+            self._scatter(self._acc_grad[j], flat, grad_g[j])
+            self._scatter(self._acc_K[j], flat, K_O[j].expand(B, self.fny, self.fnx))
+
+        N = self.p.number_of_slices
         eps = torch.finfo(self.rdt).eps
-        use_max = str(self.p.object_denom).lower().startswith('m')
         reg = float(self.p.denom_reg)
 
-        phi, den_phi = self._phi()
+        # object_denom is honoured as given, at every batch size. ePIE at B=1
+        # conventionally divides by the MAX incident intensity, because the
+        # local denominator amplifies noise in dark regions; that is what
+        # object_denom='max' selects. Forcing it at B=1 regardless made
+        # object_denom='local' silently mean 'max' there, so a comparison of
+        # preconditioners at B=1 compared nothing. denom_reg floors the local
+        # denominator at a fraction of its own maximum, which is the intended
+        # guard against the dark-region blow-up.
+        use_max = self._use_max
 
-        O = torch.stack([self._gather(self.ob_g[j], idx) for j in range(N)])  # (N,B,ny,nx)
-        s = O / self._Obar.view(N, 1, 1, 1) - 1.0
+        # --- Update Probe (if scheduled) ---
+        if do_probe:
+            peak_P = K_P.amax()
+            dn_p = peak_P if use_max else K_P + (peak_P * reg)
+            self.pr_g.add_(grad_P / dn_p.clamp_min(eps), alpha=float(self.p.beta) / N)
 
-        # --- forward ---
-        scat = s[0][:, None] * phi[0][None]                                   # H_0 = 1
-        if N > 1:
-            Fs = torch.fft.fft2(s[1:, :, None] * phi[1:, None])               # (N-1,B,M,ny,nx)
-            scat = scat + torch.fft.ifft2((self.Hb[:, None, None] * Fs).sum(0))
-        psi = self._mf_c * (self.pr_g[None] + scat)                           # (B,M,ny,nx)
+        # --- Update Object Slices ---
+        peak_K = self._acc_K.amax(dim=(-2, -1), keepdim=True)
+        dn_o = peak_K if use_max else self._acc_K + (peak_K * reg)
+        self.ob_g.add_(
+            self._acc_grad / dn_o.clamp_min(eps), alpha=float(self.p.alpha) / N
+        )
 
-        # --- modulus projection, intensities summed over probe modes ---
-        F = self._apply(self._ff_fw, psi)
-        Imod = (F.real ** 2 + F.imag ** 2).sum(dim=1)
-        amod = torch.sqrt(Imod.clamp_min(0))
-        am, mk = self.amp[idx], self.mask[idx]
-        scale = torch.where(mk > 0, am / amod.clamp_min(1e-12), torch.ones_like(amod))
-        psi_p = self._apply(self._ff_bw, F * scale[:, None].to(self.cdt))
-
-        msum = mk.sum().clamp_min(1)
-        err = np.array([float((mk * (amod - am) ** 2).sum() / msum),
-                        float((mk * (Imod - self.I[idx]) ** 2 / (self.I[idx] + 1.0)).sum() / msum),
-                        float((psi_p - psi).abs().sum())])
-
-        # --- adjoint ---
-        d = psi_p - psi
-        dj = torch.empty((N, B, self.M, self.fny, self.fnx), dtype=self.cdt, device=self.dev)
-        dj[0] = d                                                             # H_0 = 1
-        if N > 1:
-            dj[1:] = torch.fft.ifft2(self.H[:, None, None] * torch.fft.fft2(d))
-
-        # chain must be 5-D: dj is (N,B,M,ny,nx) and torch right-aligns, so a
-        # 4-D chain would put the slice axis onto the batch axis -- silently at
-        # batch_size = 1, and as a shape error otherwise
-        chain = (self._mf_c / self._Obar).conj().view(N, 1, 1, 1, 1)
-        num = (chain * phi[:, None].conj() * dj).sum(dim=2)                   # (N,B,ny,nx)
-        den = (self._mf_c / self._Obar).abs().view(N, 1, 1) ** 2 * den_phi    # (N,ny,nx)
-
-        step_o = float(self.p.alpha) / N
-        step_p = float(self.p.beta) / N
-
-        # --- probe ---
-        if self.curiter >= self.p.probe_update_start:
-            g = s[0][:, None].conj() * dj[0]
-            if N > 1:
-                Fg = torch.fft.fft2(s[1:, :, None].conj() * dj[1:])
-                g = g + torch.fft.ifft2((self.Hb[:, None, None] * Fg).sum(0))
-            num_p = (self._mf_c.conj() * (d + g)).sum(dim=0)                  # (M,ny,nx)
-            den_p = self._mf_c.abs() ** 2 * (O.abs() ** 2).sum(0).sum(0)      # (ny,nx)
-            dn = den_p.max() if use_max else den_p + reg * den_p.max()
-            self.pr_g += step_p * num_p / dn.clamp_min(eps).to(self.cdt)
-            self._phi_cache = None
-
-        # --- object ---
-        for j in range(N):
-            acc_n = torch.zeros_like(self.ob_g[j])
-            acc_d = torch.zeros(self.ob_g[j].shape, dtype=self.rdt, device=self.dev)
-            self._scatter(acc_n, idx, num[j])
-            self._scatter(acc_d, idx, den[j].expand(B, self.fny, self.fnx))
-            dn = acc_d.max() if use_max else acc_d + reg * acc_d.max()
-            self.ob_g[j] += step_o * acc_n / dn.clamp_min(eps).to(self.cdt)
-
-        return err
-
-    # ------------------------------------------------------------------ #
-    #  Iteration                                                          #
-    # ------------------------------------------------------------------ #
     def engine_iterate(self, num=1):
         B = int(self.p.batch_size)
-
         for _ in range(num):
-            self._update_mean_field()
-            order = torch.randperm(self.n_pos, device=self.dev)
+            self.pre_iteration()
 
-            err = np.zeros(3)
-            for s in range(0, self.n_pos, B):
-                err += self._batch_update(order[s:s + B])
-            err /= float(self.n_pos)
+            if self.p.shuffle:
+                order = (
+                    torch.randperm(self.n_pos, device=self.dev)
+                    if self._order_gen is None
+                    else torch.randperm(
+                        self.n_pos, generator=self._order_gen, device=self.dev
+                    )
+                )
+            else:
+                order = torch.arange(self.n_pos, device=self.dev)
 
-            logger.info("iter %d: |Obar| = %s, arg(Obar) = %s"
-                        % (self.curiter,
-                           np.array2string(self._Obar.abs().cpu().numpy(), precision=4),
-                           np.array2string(self._Obar.angle().cpu().numpy(), precision=4)))
-            self._plot_iteration_progress()
+            self._err.zero_()
+            for s in range(0, order.numel(), B):
+                self._step(order[s : s + B])
+            err = (self._err / float(self.n_pos)).cpu().numpy()
+
+            if self._plot_int and self.curiter % self._plot_int == 0:
+                self._plot_progress()
             self.curiter += 1
+        return {"all": err}
 
-        return {'all': err}
-
-    def _plot_iteration_progress(self):
-        try:
-            probe = (self.pr_g[0].abs() ** 2).cpu().numpy()
-            first = self.ob_g[0].angle().cpu().numpy()
-            final = self.ob_g[-1].angle().cpu().numpy()
-
-            fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-            for ax, im, title, cmap in (
-                    (axes[0], probe, f"Probe Intensity (Iter {self.curiter})", 'viridis'),
-                    (axes[1], first, f"Slice 0 (First) Phase (Iter {self.curiter})", 'gray'),
-                    (axes[2], final,
-                     f"Slice {self.p.number_of_slices - 1} (Final) Phase (Iter {self.curiter})", 'gray')):
-                h = ax.imshow(im, cmap=cmap)
-                ax.set_title(title)
-                fig.colorbar(h, ax=ax, fraction=0.046, pad=0.04)
-
-            ob = self._Obar.cpu().numpy()
-            plt.suptitle(f"|c| = {abs(complex(self._mf_c.cpu())):.4f}   "
-                         f"|Obar| = {np.array2string(np.abs(ob), precision=3)}   "
-                         f"arg(Obar) = {np.array2string(np.angle(ob), precision=3)}")
-            plt.tight_layout()
-            plt.savefig(f"{self.plot_progress_dir}/iter_progress_{self.curiter:04d}.png")
-            plt.close(fig)
-        except Exception as e:
-            logger.warning(f"Could not plot iteration progress: {e}")
+    def _plot_progress(self):
+        torch_helpers.plot_progress(
+            self.pr_g,
+            self.ob_g,
+            self.curiter,
+            self.plot_progress_dir,
+            psize=getattr(self.p, "psize", (1e-6, 1e-6)),
+        )
 
     def engine_finalize(self):
         for i in range(self.p.number_of_slices):
@@ -511,22 +610,29 @@ class FirstBornTorch(stochastic.EPIE):
         for i in range(1, self.p.number_of_slices):
             self.ob *= self._object[i]
 
-        info = Param()
-        info.number_of_slices = self.p.number_of_slices
-        info.slice_thickness = self.p.slice_thickness
-        info.mean_field = self.p.mean_field
-        info.object_denom = self.p.object_denom
-        info.batch_size = self.p.batch_size
-        info.Obar = self._Obar.cpu().numpy()
-        info.objects = {ob.ID: {ID: S._to_dict() for ID, S in ob.storages.items()}
-                        for ob in self._object}
+        info = Param(
+            number_of_slices=self.p.number_of_slices,
+            slice_thickness=self.p.slice_thickness,
+            batch_size=self.p.batch_size,
+            alpha=self.p.alpha,
+            objects={
+                ob.ID: {ID: S._to_dict() for ID, S in ob.storages.items()}
+                for ob in self._object
+            },
+        )
+        info.update(self.extra_slices_info())
 
-        h5opt = io.h5options['UNSUPPORTED']
-        io.h5options['UNSUPPORTED'] = 'ignore'
-        logger.info("saving slices to %s" % self.p.fslices)
-        io.h5write(self.p.fslices,
-                   header={'description': 'First Born multislice reconstruction'},
-                   content=info)
-        io.h5options['UNSUPPORTED'] = h5opt
+        # We must tell ptypy to ignore its own custom class types when saving to HDF5
+        h5opt = io.h5options["UNSUPPORTED"]
+        io.h5options["UNSUPPORTED"] = "ignore"
+
+        logger.info(f"saving slices to {self.p.fslices}")
+        io.h5write(
+            self.p.fslices,
+            header={"description": "First Born multislice"},
+            content=info,
+        )
+
+        io.h5options["UNSUPPORTED"] = h5opt
 
         return super().engine_finalize()

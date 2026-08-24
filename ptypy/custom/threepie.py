@@ -192,32 +192,6 @@ class ThreePIE(stochastic.EPIE):
             pod.object = self._object[-1][pod.ob_view]
             pod.exit = self._exits[-1][pod.pr_view]
 
-            # --- PLOT FIRST RUN THROUGH ---
-            if self.curiter == 0 and not self._has_plotted_first_run:
-                # Retrieve the initial incident probe at z=0
-                initial_probe = self._probe[0][pod.pr_view]
-                
-                fig, axs = plt.subplots(2, 2, figsize=(10, 10))
-                
-                # Plot Initial Probe
-                axs[0, 0].imshow(np.abs(initial_probe), cmap='viridis')
-                axs[0, 0].set_title('Initial Probe Amplitude (ThreePIE)')
-                axs[0, 1].imshow(np.angle(initial_probe), cmap='twilight')
-                axs[0, 1].set_title('Initial Probe Phase (ThreePIE)')
-                
-                # Plot Exit Wave
-                axs[1, 0].imshow(np.abs(pod.exit), cmap='viridis')
-                axs[1, 0].set_title('Exit Wave Amplitude (ThreePIE)')
-                axs[1, 1].imshow(np.angle(pod.exit), cmap='twilight')
-                axs[1, 1].set_title('Exit Wave Phase (ThreePIE)')
-                
-                plt.tight_layout()
-                plt.savefig('threepie_first_run_probe_and_detector.png')
-                plt.close(fig)
-                
-                logger.info("Saved first run probe and exit wave to 'threepie_first_run_probe_and_detector.png'")
-                self._has_plotted_first_run = True
-            # ------------------------------
 
         # Fourier update
         error = self.fourier_update(view)
@@ -274,6 +248,13 @@ class ThreePIE(stochastic.EPIE):
             slice_final_raw = next(iter(self._object[-1].storages.values())).data
             slice_final = slice_final_raw[0] if slice_final_raw.ndim == 3 else slice_final_raw
 
+            # unwrap
+            slice_final = np.unwrap(np.angle(slice_final))
+            slice_first = np.unwrap(np.angle(slice_first))
+
+            # remove mean phase for display
+            slice_first = slice_first - np.mean(slice_first[124:127,640:680])
+            slice_final = slice_final - np.mean(slice_final[124:127,640:680])
             fig, axes = plt.subplots(1, 3, figsize=(15, 5))
             
             # 1. Probe Intensity
@@ -282,12 +263,12 @@ class ThreePIE(stochastic.EPIE):
             fig.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04)
 
             # 2. First Slice Object Phase
-            im1 = axes[1].imshow(np.angle(slice_first), cmap='gray')
+            im1 = axes[1].imshow(slice_first, cmap='gray')
             axes[1].set_title(f"Slice 0 (First) Phase (Iter {self.curiter})")
             fig.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04)
 
             # 3. Final Slice Object Phase
-            im2 = axes[2].imshow(np.angle(slice_final), cmap='gray')
+            im2 = axes[2].imshow(slice_final, cmap='gray')
             axes[2].set_title(f"Slice {self.p.number_of_slices-1} (Final) Phase (Iter {self.curiter})")
             fig.colorbar(im2, ax=axes[2], fraction=0.046, pad=0.04)
 

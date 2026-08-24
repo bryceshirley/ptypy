@@ -49,17 +49,28 @@ slice_thickness  = 1580.e-6
 # which reconstruction to analyse
 engine_name      = 'MomentumFirstBorn'   # the engine that wrote the slices
 Niter_rec        = 500                   # its numiter, i.e. the fslices name
-# The probe and the slices must come from the SAME run. The fslices name
-# carries the engine's numiter and the .ptyr name the iteration it reached, so
-# the engine picks the .ptyr for `engine_name` with the highest iteration and
-# then the slice file at that same iteration. If they disagree it stops: the
-# check is prod_j O_j == obj, which engine_finalize guarantees within a run.
+slices_tag       = None                  # substring picking one slice file,
+                                         # e.g. 'threePIE'; None -> highest iter
+iteration        = 500                   # compare only reconstructions at this
+                                         # iteration: different engines converge
+                                         # at different rates, so a cross-engine
+                                         # comparison is like for like only at
+                                         # a fixed iteration count
+compare          = ['threePIE']          # further reconstructions of the SAME
+                                         # scan to measure in the same run
+# The probe and the slices must come from the SAME run, and the engine works
+# that out by measurement rather than by filename: every candidate probe is
+# tried against every candidate slice stack and the pair that best predicts the
+# recorded frames wins. `compare` then repeats the whole measurement on other
+# reconstructions of the same scan -- the 3PIE one here -- which is the control
+# for the objection that eps_1 might be an artefact of having fitted the object
+# with the very model under test.
 
 # diagnostics
 max_order        = 2       # M = N returns exact multislice, the pipeline check
 blocks           = None    # None -> 1..N
 gauge            = 'both'  # 'none', 'mean' or 'both'
-batch_size       = 32
+batch_size       = 16
 n_positions      = None    # None -> every position
 compare_frames   = 3
 precision        = 'double'
@@ -170,7 +181,10 @@ p.engines.engine00.numiter_contiguous = 1
 
 # what to analyse
 p.engines.engine00.ground_truth = out_dir_rec      # folder, or path_slices
-p.engines.engine00.engine_name = engine_name       # picks the matching .ptyr
+p.engines.engine00.engine_name = engine_name       # narrows the .ptyr search
+p.engines.engine00.slices = slices_tag             # which slice file
+p.engines.engine00.iteration = iteration           # and at which iteration
+p.engines.engine00.compare = compare               # and which others to match
 p.engines.engine00.number_of_slices = number_of_slices
 p.engines.engine00.slice_thickness = slice_thickness
 

@@ -379,14 +379,48 @@ class FirstBornDiagnostics(stochastic.EPIE):
     type = int
     help = Frames used for the agreement check
 
-    [auto_select_slices]
-    default = True
-    type = bool
-    help = If the chosen slice file disagrees with the data, score the others
-    doc = A results folder accumulates one fslices file per run. When the first
-          guess fails, every candidate is scored against the data and the best
-          is used, which is more reliable than matching iteration numbers in
-          filenames.
+    [iteration]
+    default = None
+    type = int
+    help = Restrict every reconstruction to one iteration count
+    doc = A results folder holds the same reconstruction at many iterations,
+          and different engines converge at different rates, so a comparison
+          across engines is only like for like at a fixed iteration. Setting
+          this to 500 compares the 500-iteration first-Born and 3PIE
+          reconstructions and nothing else.
+
+    [pair_mode]
+    default = same-iteration
+    type = str
+    help = How a slice file is matched to a probe: 'same-iteration' or 'best'
+    doc = 'same-iteration' pairs a slice stack only with a .ptyr written at the
+          same iteration, which is the pair one run produced. 'best' searches
+          every combination and takes whichever predicts the data best, which
+          can mix a probe from one run with slices from another -- a state no
+          engine ever reached, and not something to quote.
+
+    [slices]
+    default = None
+    type = str
+    help = Which reconstruction to analyse: a path, or a filename substring
+    doc = A results folder can hold several reconstructions of the same scan at
+          the same iteration, e.g. a first-Born one and a 3PIE one. Give a
+          substring such as 'threePIE' to pick one; the default takes the
+          highest iteration. The probe is paired to it by whichever .ptyr in
+          the folder best predicts the recorded data, so no naming convention
+          has to be trusted.
+
+    [compare]
+    default = None
+    type = str, list, tuple
+    help = Further reconstructions to measure in the same run
+    doc = Each entry is a path or a filename substring, e.g. 'threePIE'. Every
+          entry gets the full epsilon measurement with its own probe, and the
+          recovered slices are compared with the primary reconstruction's. This
+          is the control for the obvious objection to Sec. (xray): if eps_1 is
+          the same for an object fitted with multislice as for one fitted with
+          first Born, it is a property of the specimen and not an artefact of
+          having fitted the object with the model under test.
 
     [number_of_slices]
     default = 2
@@ -557,70 +591,27 @@ class FirstBornDiagnostics(stochastic.EPIE):
         self._collect_views()
 
         # ---- the reconstruction under test ----------------------------
-        gt = self.p.ground_truth
-        ptyr = _find_ptyr(gt, self.p.ptyr, self.p.engine_name)
-        cands = _slice_candidates(gt, None)
-        fslices = _pick_slices(cands, _iter_of(ptyr) if ptyr else None)
-        self._ptyr_path = ptyr
-
-        pr = _read_ptyr(ptyr) if ptyr else dict(probe=None, obj=None)
-        if pr['probe'] is not None:
-            logger.info("probe from %s" % ptyr)
-            probe = pr['probe']
-        else:
-            logger.warning("no .ptyr probe found; using the live P.probe")
-            probe = self._prs.data
-        if probe.shape[-2:] != (self.fny, self.fnx):
-            raise ValueError("probe frame %s does not match the geometry %s"
-                             % (probe.shape[-2:], (self.fny, self.fnx)))
-        self.M = probe.shape[0]
-        self.pr_g = torch.as_tensor(np.ascontiguousarray(probe),
-                                    dtype=self.cdt, device=self.dev)
-
-        # The real test of whether a probe and a slice stack belong together is
-        # whether they predict the recorded diffraction. That is decisive where
-        # a container identity is not: what a .ptyr's object group happens to
-        # hold depends on what the engine last wrote into it.
-        if fslices is None:
-            logger.warning("no slice file under %s; using the live P.obj" % gt)
-            self._load_slices([self._obs.data[0]], 1)
-            corr = self._data_correlation()
-        else:
-            corr = self._try_slices(fslices)
-            if corr < float(self.p.data_check_threshold) and len(cands) > 1 \
-                    and bool(self.p.auto_select_slices):
-                logger.warning("%s predicts the data at correlation %.3f; "
-                               "scanning the other %d slice files"
-                               % (os.path.basename(fslices), corr, len(cands) - 1))
-                _pick_slices(cands, None, verbose=True)
-                scores = {fslices: corr}
-                for c in cands:
-                    if c == fslices:
-                        continue
-                    try:
-                        scores[c] = self._try_slices(c)
-                    except Exception as e:      # noqa: BLE001
-                        logger.warning("  %s unreadable (%s)"
-                                       % (os.path.basename(c), e))
-                logger.info("slice file agreement with the data:")
-                for c, v in sorted(scores.items(), key=lambda kv: -kv[1]):
-                    logger.info("    corr %6.3f   %s" % (v, os.path.basename(c)))
-                fslices, corr = max(scores.items(), key=lambda kv: kv[1])
-                self._try_slices(fslices)
-            logger.info("using slices from %s (correlation %.3f)"
-                        % (fslices, corr))
-
-        self._slices_path = fslices
+        # Every candidate probe is scored against every candidate slice stack
+        # by how well the pair predicts the recorded frames, so neither the
+        # file naming nor the .ptyr object container has to be trusted.
+        logger.info("pairing reconstructions against the data:")
+        fslices, ptyr, corr = self._resolve_pair(self.p.slices,
+                                                 self.p.engine_name)
+        self._slices_path, self._ptyr_path = fslices, ptyr
         self._results['data_correlation'] = corr
+        logger.info("using %s with %s (correlation %.3f)"
+                    % (os.path.basename(fslices),
+                       os.path.basename(ptyr) if ptyr else 'the live P.probe',
+                       corr))
         if corr < float(self.p.data_check_threshold):
-            msg = ("the loaded probe and slices do not predict the recorded "
-                   "data (amplitude correlation %.3f over %d frames).\n"
-                   "  slices : %s\n  probe  : %s\n"
-                   "They are probably from different runs, or the geometry "
-                   "does not match this scan. Lower data_check_threshold to "
-                   "proceed anyway." % (corr, int(self.p.check_frames),
-                                        fslices, ptyr))
-            raise RuntimeError(msg)
+            raise RuntimeError(
+                "the best (slices, probe) pair predicts the recorded data at "
+                "only %.3f over %d frames.\n  slices : %s\n  probe  : %s\n"
+                "Either the reconstruction is not of this scan, or the "
+                "geometry does not match. Lower data_check_threshold to "
+                "proceed anyway." % (corr, int(self.p.check_frames),
+                                     fslices, ptyr))
+        pr = _read_ptyr(ptyr) if ptyr else dict(probe=None, obj=None)
 
         self._provenance(pr['obj'])
         self._probe_na()
@@ -629,8 +620,23 @@ class FirstBornDiagnostics(stochastic.EPIE):
                     % (self.N, np.round(self.z * 1e6, 3).tolist(),
                        self.n_pos, self.M))
 
+    def _set_probe(self, probe):
+        """Install a probe and drop anything cached from the previous one.
+
+        phi, the unscattered exit field and the H stacks are all functions of
+        the probe, N and z, so every assignment to any of the three has to
+        invalidate them together. Forgetting this is silent: the null-space and
+        depth tests measure differences, in which a stale unscattered term
+        cancels, so a wrong cache would not show up in their numbers.
+        """
+        self.pr_g = (probe if torch.is_tensor(probe)
+                     else torch.as_tensor(np.ascontiguousarray(probe),
+                                          dtype=self.cdt, device=self.dev))
+        self._illum_cache = None
+
     def _load_slices(self, slices, n=None):
         """Put a slice stack on the device and set the axial positions."""
+        self._illum_cache = None          # z and N feed the H stacks
         self.N = N = len(slices) if n is None else n
         self.ob_g = torch.stack([torch.as_tensor(s, dtype=self.cdt,
                                                  device=self.dev)
@@ -640,21 +646,6 @@ class FirstBornDiagnostics(stochastic.EPIE):
             self.z = np.concatenate([[0.0], np.cumsum(np.asarray(th, float))])[:N]
         else:
             self.z = np.arange(N, dtype=float) * float(th)
-
-    def _try_slices(self, path):
-        """Load a candidate slice file and score it against the data."""
-        slices = _read_slices(path)
-        if slices[0].shape != (self.ony, self.onx):
-            logger.warning("%s has object shape %s, this scan needs %s"
-                           % (os.path.basename(path), slices[0].shape,
-                              (self.ony, self.onx)))
-            return -1.0
-        if len(slices) != int(self.p.number_of_slices):
-            logger.info("%s holds %d slices (number_of_slices = %d)"
-                        % (os.path.basename(path), len(slices),
-                           int(self.p.number_of_slices)))
-        self._load_slices(slices)
-        return self._data_correlation()
 
     def _data_correlation(self, n=None):
         """Amplitude correlation between the multislice prediction and the
@@ -898,29 +889,103 @@ class FirstBornDiagnostics(stochastic.EPIE):
             na_mrad=self.na * 1e3, a_c_m=self.a_c,
             precision=str(self.p.precision))
 
+        # Is the reconstruction anywhere near the natural gauge? The per-slice
+        # mean transmission is not determined by the data (Eq. null-const), and
+        # a reconstruction free to wander in it will. Phi_tot, |g|, the mean
+        # modulus and eps_M itself are all measured from that offset, so a
+        # stack carrying a constant phase of a couple of radians reports a
+        # projected phase of several radians and an eps_1 above one, none of
+        # which describes the specimen.
+        cov = self._coverage()
+        means = [complex(self.ob_g[j][cov].mean().cpu()) for j in range(self.N)]
+        offs = [abs(np.angle(m)) for m in means]
+        self._results['run']['slice_mean_phase_rad'] = [float(np.angle(m))
+                                                        for m in means]
+        self._results['run']['slice_mean_modulus'] = [float(abs(m))
+                                                      for m in means]
         gauges = (['none', 'mean'] if str(self.p.gauge) == 'both'
                   else [str(self.p.gauge)])
+        if max(offs) > 0.2:
+            logger.warning("the slices carry a per-slice mean phase of %s rad, "
+                           "so the as-reconstructed gauge is not the natural "
+                           "one; quote the mean-gauge numbers"
+                           % np.round(offs, 3).tolist())
+            if 'mean' in gauges:
+                gauges = ['mean'] + [g for g in gauges if g != 'mean']
         base_ob = self.ob_g.clone()
         base_pr = self.pr_g.clone()
 
         for gauge in gauges:
-            self.ob_g, self.pr_g = base_ob.clone(), base_pr.clone()
+            self.ob_g = base_ob.clone()
+            self._set_probe(base_pr.clone())
             alpha = self._apply_gauge(gauge)
             res = self._scan(gauge)
             res['alpha'] = [complex(a) for a in alpha]
             self._results['gauge_' + gauge] = res
             if gauge == gauges[0]:
                 # promote the primary gauge to the top level for convenience
+                self._results['primary_gauge'] = gauge
                 self._results['eps_order'] = res['eps_order']
                 self._results['eps_linearised'] = res['eps_linearised']
 
-        # gauge-independent structural tests
-        self.ob_g, self.pr_g = base_ob, base_pr
+        # Structural tests. The null-space and depth tests measure ratios of
+        # responses and are gauge insensitive; the preconditioner test reads
+        # |O_j| directly and is not, so it runs on the gauge-fixed stack --
+        # otherwise a per-slice modulus of 0.83 that is pure gauge reads as
+        # 17% absorption.
+        self.ob_g = base_ob.clone()
+        self._set_probe(base_pr.clone())
+        self._apply_gauge('mean')
+        gauge_fixed_ob = self.ob_g.clone()
+        self.ob_g = base_ob
+        self._set_probe(base_pr)
         self._results['null_space'] = self._null_test()
         if bool(self.p.depth_sweep) and self.N > 1:
             self._results['depth_separability'] = self._depth_sweep()
         if bool(self.p.precond_test) and self.N > 1:
+            keep = self.ob_g
+            self.ob_g = gauge_fixed_ob
             self._results['preconditioner'] = self._precond_test()
+            self.ob_g = keep
+
+        # ---- the same measurement on other reconstructions of this scan ----
+        comp = self.p.compare
+        if comp:
+            comp = [comp] if isinstance(comp, str) else list(comp)
+            primary_ob = self.ob_g.clone()
+            primary_pr = self.pr_g.clone()
+            primary_N, primary_z = self.N, self.z
+            for tag in comp:
+                try:
+                    logger.info("comparison reconstruction '%s':" % tag)
+                    sl, pt, cc = self._resolve_pair(tag, None)
+                    if cc < float(self.p.data_check_threshold):
+                        logger.warning("  '%s' predicts the data at only %.3f;"
+                                       " skipping" % (tag, cc))
+                        continue
+                    logger.info("  %s with %s (correlation %.3f)"
+                                % (os.path.basename(sl),
+                                   os.path.basename(pt) if pt else 'live probe',
+                                   cc))
+                    # Always the mean gauge here. Two reconstructions sit in
+                    # whatever gauge their engine drifted into (Eq. null-const
+                    # leaves it free), and eps, Phi_tot and |g| are all
+                    # measured from that offset, so comparing them in their own
+                    # gauges compares the offsets and not the specimens.
+                    self._apply_gauge('mean')
+                    res = self._scan('mean')
+                    res['gauge_used'] = 'mean'
+                    res['slices'] = sl
+                    res['ptyr'] = pt
+                    res['data_correlation'] = cc
+                    res['object_vs_primary'] = self._object_difference(
+                        primary_ob.cpu().numpy())
+                    self._results['compare_' + str(tag)] = res
+                except Exception as e:                      # noqa: BLE001
+                    logger.warning("  comparison '%s' failed: %s" % (tag, e))
+            self.ob_g = primary_ob
+            self._set_probe(primary_pr)
+            self.N, self.z = primary_N, primary_z
 
         if bool(self.p.benchmark):
             self._results['benchmark'] = self._benchmark()
@@ -929,6 +994,161 @@ class FirstBornDiagnostics(stochastic.EPIE):
         self._report()
         self._results['run']['seconds'] = (datetime.now() - t0).total_seconds()
 
+    def _resolve_pair(self, tag=None, engine=None, verbose=True):
+        """Find a (slice stack, probe) pair and score it against the data.
+
+        A results folder can hold several reconstructions of the same scan at
+        the same iteration --- a first-Born one and a 3PIE one, say --- and
+        several .ptyr dumps to go with them. Rather than trust a naming
+        convention to pair them, every candidate probe is tried against the
+        chosen slice stack and the pair that best predicts the recorded frames
+        wins. That is the same test the startup check uses, and it is decisive
+        where a filename is not.
+
+        Returns (slices_path, ptyr_path, correlation), with the winning pair
+        already installed.
+        """
+        gt = self.p.ground_truth
+        cands = _slice_candidates(gt, None)
+        if tag is None:
+            # never let the primary silently land on a reconstruction that is
+            # meant to be the control: comparing a file with itself returns a
+            # ratio of exactly 1 and looks like a result
+            for other in ([self.p.compare] if isinstance(self.p.compare, str)
+                          else list(self.p.compare or [])):
+                cands = [c for c in cands
+                         if str(other).lower() not in os.path.basename(c).lower()]
+        if tag:
+            tag = str(tag)
+            if os.path.isfile(tag):
+                cands = [tag]
+            else:
+                cands = [c for c in cands
+                         if tag.lower() in os.path.basename(c).lower()]
+            if not cands:
+                raise RuntimeError("no slice file matches '%s' under %s"
+                                   % (tag, gt))
+        if self.p.iteration:
+            want = int(self.p.iteration)
+            sel = [c for c in cands if _slice_iter(c) == want]
+            if not sel:
+                raise RuntimeError("no slice file at iteration %d under %s%s"
+                                   % (want, gt,
+                                      " matching '%s'" % tag if tag else ""))
+            cands = sel
+        cands = sorted(cands, key=_slice_iter)[::-1][:4]
+
+        probes = []
+        if self.p.ptyr and os.path.isfile(str(self.p.ptyr)):
+            probes = [str(self.p.ptyr)]
+        elif gt and os.path.isdir(gt):
+            # every dump is a candidate, whatever engine wrote it: the probe
+            # that best predicts the data is the right probe, and restricting
+            # the pool by engine name would have hidden that the 200-iteration
+            # probe beats the 500-iteration one
+            probes = sorted(glob.glob(os.path.join(gt, '*.ptyr')),
+                            key=_iter_of)[::-1]
+        if not probes:
+            probes = [None]
+
+        # A probe from one run and slices from another is not a
+        # reconstruction: no engine ever produced that state, so its eps and
+        # chi^2 describe nothing that exists. Prefer the probe whose iteration
+        # matches the slice file's, and only fall back to the whole pool when
+        # there is no such probe. Agreement with the data is then a check on
+        # the pair, not the thing that selects it.
+        same_run = str(self.p.pair_mode).startswith('same')
+        best = (None, None, -2.0)
+        ranked = []
+        for c in cands:
+            try:
+                slices = _read_slices(c)
+            except Exception as e:                          # noqa: BLE001
+                logger.warning("  %s unreadable (%s)" % (os.path.basename(c), e))
+                continue
+            if slices[0].shape != (self.ony, self.onx):
+                continue
+            self._load_slices(slices)
+            pool = probes
+            if same_run:
+                matched = [p for p in probes if _iter_of(p) == _slice_iter(c)]
+                if matched:
+                    pool = matched
+                    # within one iteration a folder may still hold dumps from
+                    # several engines; prefer the one named, if any match
+                    named = [p for p in pool if engine
+                             and str(engine).lower() in _engine_of(p).lower()]
+                    if named:
+                        pool = named
+                elif verbose:
+                    logger.warning("    no probe at iteration %d for %s; "
+                                   "falling back to the whole pool, so the "
+                                   "pair may mix two runs"
+                                   % (_slice_iter(c), os.path.basename(c)))
+            for pp in pool:
+                pr = _read_ptyr(pp)['probe'] if pp else self._prs.data
+                if pr is None or pr.shape[-2:] != (self.fny, self.fnx):
+                    continue
+                self._set_probe(pr)
+                corr = self._data_correlation()
+                ranked.append((corr, c, pp))
+                if corr > best[2]:
+                    best = (c, pp, corr)
+        if verbose and ranked:
+            ranked.sort(reverse=True)
+            logger.info("    best pairings by agreement with the data:")
+            for corr, c, pp in ranked[:5]:
+                logger.info("      %6.3f  %s + %s"
+                            % (corr, os.path.basename(c),
+                               os.path.basename(pp) if pp else 'live P.probe'))
+        if best[0] is None:
+            raise RuntimeError("no usable (slices, probe) pair under %s" % gt)
+        # reinstall the winner
+        self._load_slices(_read_slices(best[0]))
+        self._set_probe(_read_ptyr(best[1])['probe'] if best[1]
+                        else self._prs.data)
+        self.M = int(self.pr_g.shape[0])
+        return best
+
+    def _object_difference(self, other):
+        """How far apart are two reconstructions of the same scan?
+
+        eps_M compares two forward models on one object. This compares two
+        objects, which is the question a reader actually has: does fitting with
+        the truncated model change the answer? Both stacks are put in the same
+        gauge first, since the per-slice mean is not determined by the data
+        (Eq. null-const), and the comparison is restricted to the illuminated
+        region.
+        """
+        cov = self._coverage().cpu().numpy()
+        a = self.ob_g.cpu().numpy()
+        b = np.asarray(other)
+        if b.shape != a.shape:
+            return None
+        out = []
+        for j in range(a.shape[0]):
+            x, y = a[j][cov], b[j][cov]
+            x = x / (x.mean() if abs(x.mean()) > 1e-9 else 1.0)
+            y = y / (y.mean() if abs(y.mean()) > 1e-9 else 1.0)
+            al = np.vdot(y, x) / max(np.vdot(y, y).real, 1e-30)
+            rel = float(np.linalg.norm(x - al * y) / max(np.linalg.norm(x), 1e-30))
+            dphi = np.angle(x) - np.angle(al * y)
+            dphi -= dphi.mean()
+            out.append(dict(slice=j, relative_difference=rel,
+                            phase_rms_rad=float(np.sqrt((dphi ** 2).mean())),
+                            phase_ptp_rad=float(np.ptp(np.angle(x)))))
+        return out
+
+    def _coverage(self):
+        """Illuminated region of the object grid."""
+        cov = torch.zeros((self.ony, self.onx), dtype=torch.bool, device=self.dev)
+        for s in range(0, self.n_pos, 256):
+            idx = torch.arange(s, min(s + 256, self.n_pos), device=self.dev)
+            r = self.rows[idx][:, :, None].expand(-1, self.fny, self.fnx)
+            c = self.cols[idx][:, None, :].expand(-1, self.fny, self.fnx)
+            cov[r.reshape(-1), c.reshape(-1)] = True
+        return cov
+
     def _apply_gauge(self, gauge):
         """Divide each slice by its complex mean over the illuminated region and
         push the product onto the probe. Multislice is pointwise invariant, so
@@ -936,12 +1156,7 @@ class FirstBornDiagnostics(stochastic.EPIE):
         prediction is not invariant, which is why both are reported."""
         if gauge != 'mean':
             return np.ones(self.N, dtype=complex)
-        cov = torch.zeros((self.ony, self.onx), dtype=torch.bool, device=self.dev)
-        for s in range(0, self.n_pos, 256):
-            idx = torch.arange(s, min(s + 256, self.n_pos), device=self.dev)
-            r = self.rows[idx][:, :, None].expand(-1, self.fny, self.fnx)
-            c = self.cols[idx][:, None, :].expand(-1, self.fny, self.fnx)
-            cov[r.reshape(-1), c.reshape(-1)] = True
+        cov = self._coverage()
         al = []
         for j in range(self.N):
             m = self.ob_g[j][cov].mean()
@@ -949,8 +1164,8 @@ class FirstBornDiagnostics(stochastic.EPIE):
                 m = torch.as_tensor(1.0 + 0j, dtype=self.cdt, device=self.dev)
             self.ob_g[j] = self.ob_g[j] / m
             al.append(complex(m.cpu()))
-        self.pr_g = self.pr_g * torch.as_tensor(np.prod(al), dtype=self.cdt,
-                                                device=self.dev)
+        self._set_probe(self.pr_g * torch.as_tensor(np.prod(al), dtype=self.cdt,
+                                                    device=self.dev))
         return np.array(al)
 
     def _scan(self, gauge):
@@ -1522,13 +1737,23 @@ class FirstBornDiagnostics(stochastic.EPIE):
     # ------------------------------------------------------------------ #
     def _report(self):
         r = self._results
-        prim = r['gauge_' + (('none' if str(self.p.gauge) in ('both', 'none')
-                              else str(self.p.gauge)))]
+        gk = [k for k in ('gauge_mean', 'gauge_none') if k in r]
+        # _run_all promotes the mean gauge to primary when the reconstruction
+        # is not in the natural one, so follow whatever it promoted
+        prim_key = ('gauge_' + r.get('primary_gauge')
+                    if r.get('primary_gauge') else gk[0])
+        prim = r[prim_key]
         N = self.N
         L = logger.info
         L("=" * 70)
-        L("First-Born truncation error, Eq. (epsilon)")
+        L("First-Born truncation error, Eq. (epsilon)   [gauge: %s]"
+          % prim.get('gauge', '?'))
         L("=" * 70)
+        mp = r['run'].get('slice_mean_phase_rad')
+        if mp is not None and max(abs(x) for x in mp) > 0.2:
+            L("  per-slice mean phase %s rad: the as-reconstructed gauge is "
+              "not natural, so only the mean-gauge numbers describe the "
+              "specimen" % np.round(mp, 3).tolist())
         for M, e in sorted(prim['eps_order'].items()):
             tag = ('unscattered only' if M == 0 else
                    'Eq. (model), first Born' if M == 1 else
@@ -1568,6 +1793,38 @@ class FirstBornDiagnostics(stochastic.EPIE):
              prim['counts_visible_above']))
         L("chi^2/px against the data: multislice %.4g, Born %.4g, tangent %.4g"
           % (prim['chi2_multislice'], prim['chi2_born'], prim['chi2_linearised']))
+        comps = {k[8:]: v for k, v in r.items() if k.startswith('compare_')}
+        if comps:
+            L("")
+            L("The same measurement on other reconstructions of this scan,")
+            L("all in the mean gauge, which is the only way they compare:")
+            L("  %-22s %10s %10s %10s %9s %9s"
+              % ('reconstruction', 'eps_1', 'tangent', 'Phi_tot', 'chi2 MS', 'chi2 FB'))
+            pm = r.get('gauge_mean', prim)
+            L("  %-22s %10.4e %10.4e %10.4f %9.1f %9.1f"
+              % ('primary', pm['eps_order'].get(1, np.nan),
+                 pm['eps_linearised'], pm['phi_tot_rms'],
+                 pm['chi2_multislice'], pm['chi2_born']))
+            for k, v in comps.items():
+                L("  %-22s %10.4e %10.4e %10.4f %9.1f %9.1f"
+                  % (k, v['eps_order'].get(1, np.nan), v['eps_linearised'],
+                     v['phi_tot_rms'], v['chi2_multislice'], v['chi2_born']))
+                od = v.get('object_vs_primary')
+                if od:
+                    L("      recovered slices vs the primary reconstruction: "
+                      + ', '.join('slice %d %.3f rel, %.3f rad rms'
+                                  % (d['slice'], d['relative_difference'],
+                                     d['phase_rms_rad']) for d in od))
+            e_p = r.get('gauge_mean', prim)['eps_order'].get(1, np.nan)
+            for k, v in comps.items():
+                e_c = v['eps_order'].get(1, np.nan)
+                L("  '%s' gives eps_1 = %.3fx the primary value: %s"
+                  % (k, e_c / max(e_p, 1e-30),
+                     'the truncation error is a property of the specimen, not '
+                     'of the model that fitted the object'
+                     if 0.7 < e_c / max(e_p, 1e-30) < 1.4 else
+                     'the two differ, so the object does absorb part of the '
+                     'truncation error -- report both'))
         if 'gauge_mean' in r and 'gauge_none' in r:
             L("gauge: eps_1 = %.4e (none) vs %.4e (mean)"
               % (r['gauge_none']['eps_order'].get(1, np.nan),
@@ -1635,6 +1892,15 @@ class FirstBornDiagnostics(stochastic.EPIE):
                       label=r'$\frac{1}{2}\Phi^2(1-1/N)$')
             ax.loglog(pp, pp ** 2 / (np.sqrt(2) * N), 'k--',
                       label=r'$\Phi^2/(\sqrt{2}N)$')
+            # Phi spans well under a decade, so there are no major ticks in
+            # range: label the minor ones plainly instead of leaving the axis
+            # bare or letting the default mantissa labels collide.
+            from matplotlib.ticker import ScalarFormatter, LogLocator
+            ax.xaxis.set_major_locator(LogLocator(subs=(1.0, 2.0, 3.0, 4.0,
+                                                        5.0, 6.0, 8.0)))
+            ax.xaxis.set_major_formatter(ScalarFormatter())
+            ax.xaxis.set_minor_formatter(ScalarFormatter())
+            ax.tick_params(axis='x', labelsize=7)
             ax.set_xlabel(r'$\Phi_{\rm tot}$ (rad)')
             ax.set_ylabel(r'$\epsilon_1$')
             ax.set_title('per position, against the estimates')
@@ -1707,6 +1973,50 @@ class FirstBornDiagnostics(stochastic.EPIE):
             _save(fig, od, '06_reconstruction.png')
         except Exception as e:      # noqa: BLE001
             logger.warning("figure 6 failed: %s" % e)
+
+        # 8 -- the same measurement on other reconstructions
+        try:
+            comps = {k[8:]: v for k, v in self._results.items()
+                     if k.startswith('compare_')}
+            if comps:
+                fig, axs = plt.subplots(1, 2, figsize=(9.6, 3.9))
+                a = axs[0]
+                Ms = sorted(d['eps_order'])
+                a.semilogy(Ms, [d['eps_order'][m] for m in Ms], 'o-', ms=4,
+                           label='primary (first Born fit)')
+                a.semilogy(Ms, [d['eps_order_tangent'][m] for m in Ms], 'X--',
+                           ms=4, color='crimson', alpha=0.6,
+                           label='primary, tangent')
+                for k, v in comps.items():
+                    a.semilogy(sorted(v['eps_order']),
+                               [v['eps_order'][m] for m in sorted(v['eps_order'])],
+                               's-', ms=4, label=k)
+                a.set_xticks(Ms)
+                a.set_xlabel(r'truncation order $M$')
+                a.set_ylabel(r'$\epsilon_M$')
+                a.set_title('same measurement, different reconstructions')
+                a.legend(fontsize=7)
+                a.grid(alpha=0.3)
+
+                a = axs[1]
+                names = ['primary'] + list(comps)
+                e1 = [d['eps_order'].get(1, np.nan)] + \
+                     [v['eps_order'].get(1, np.nan) for v in comps.values()]
+                chi = [d['chi2_born'] / max(d['chi2_multislice'], 1e-30) - 1] + \
+                      [v['chi2_born'] / max(v['chi2_multislice'], 1e-30) - 1
+                       for v in comps.values()]
+                x = np.arange(len(names))
+                a.bar(x - 0.2, e1, 0.4, label=r'$\epsilon_1$')
+                a.bar(x + 0.2, chi, 0.4, label=r'$\chi^2$ penalty')
+                a.set_xticks(x)
+                a.set_xticklabels(names, fontsize=7)
+                a.set_ylabel('relative')
+                a.set_title('truncation cost per reconstruction')
+                a.legend(fontsize=7)
+                a.grid(alpha=0.3, axis='y')
+                _save(fig, od, '08_reconstruction_comparison.png')
+        except Exception as e:      # noqa: BLE001
+            logger.warning("figure 8 failed: %s" % e)
 
         # 7 -- cost against slice count
         try:
