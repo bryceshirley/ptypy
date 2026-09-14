@@ -4,7 +4,7 @@ Multislice data simulator, as a ptypy engine.
 
 WHAT THIS IS
 ------------
-A companion to FirstBornDiagnostics, and a subclass of it: everything about
+A companion to ISSDiagnostics, and a subclass of it: everything about
 loading a finished reconstruction -- the (slices, probe) pairing scored
 against the recorded data, the geometry, the views, the far-field operators,
 the multislice cascade -- is inherited unchanged. What this engine does with
@@ -28,7 +28,7 @@ the reconstruction is different: instead of measuring truncation errors, it
 The ground truth -- the layer stack, the axial positions, the probe the data
 were simulated with, and the per-particle assignment table -- is written to an
 .h5 in the same content/objects layout the reconstruction engines use for
-fslices, so borndiagnostics._read_slices and every scoring tool read it
+fslices, so issdiagnostics._read_slices and every scoring tool read it
 directly.
 
 Because the geometry, positions, mask and far field all come from the same
@@ -63,8 +63,8 @@ from matplotlib.colors import LogNorm
 from ptypy.engines import register
 from ptypy.utils.verbose import logger
 
-from . import borndiagnostics
-from .borndiagnostics import _jsonable
+from . import issdiagnostics
+from .issdiagnostics import _jsonable
 
 try:
     import torch
@@ -78,7 +78,7 @@ except ImportError:  # pragma: no cover
 
 
 @register()
-class MultisliceSimulator(borndiagnostics.FirstBornDiagnostics):
+class MultisliceSimulator(issdiagnostics.ISSDiagnostics):
     """
     Load a finished reconstruction, redistribute its particles over many
     layers, simulate detector data with exact multislice, and write a .ptyd
@@ -858,6 +858,19 @@ class SparseStrongSimulator(MultisliceSimulator):
           spreads by the probe NA plus the particle's own spectrum, so
           NA_eff = shear_na_scale * NA(probe). The cross-layer gap enforced
           is r_a + r_b + max(R_j + R_k, shear) + cone_margin_px.
+
+    [overlap_gap_px]
+    default = -1
+    type = int
+    help = Deterministic collinear placement for the dose experiment [px]
+    doc = Negative (default) uses the random beam-cone-disjoint placement
+          above. When >= 0 the single strongest segmented particle is pasted
+          on EVERY layer, collinear along x, with adjacent centres this many
+          pixels apart (symmetric about the coverage centre). Sliding this one
+          gap from beyond the scattered-wave shear (disjoint, eps1 ~ 1e-4)
+          down towards zero (fully overlapped, eps1 ~ 1e-2) makes lateral
+          overlap the only variable, which is exactly what the dose-criterion
+          sweep of Sec. sec:sparse needs: eps1 tuned by geometry alone.
     """
 
     # ------------------------------------------------------------------ #
@@ -979,6 +992,10 @@ class SparseStrongSimulator(MultisliceSimulator):
             s_pow = s_eff
         logger.info("pasted particle phase reaches %.2f rad (smooth_px %.1f)"
                     % (s_pow * max_src, sig))
+
+        if int(self.p.overlap_gap_px) >= 0:
+            return self._build_layers_collinear(
+                layers, prepped, s_pow, z_sim, R, shear_px)
 
         cov = self._coverage().cpu().numpy()
         fr = self.rows[:, self.fny // 2].cpu().numpy()
@@ -1104,6 +1121,57 @@ class SparseStrongSimulator(MultisliceSimulator):
         if gaps:
             logger.info("cross-layer slack beyond the shear+cone "
                         "requirement: min %.0f px" % min(gaps))
+        return layers, table
+
+    # ------------------------------------------------------------------ #
+    #  Deterministic overlap-controlled placement (dose experiment)       #
+    # ------------------------------------------------------------------ #
+    def _build_layers_collinear(self, layers, prepped, s_pow, z_sim, R,
+                                shear_px):
+        """The single strongest segmented particle pasted on EVERY layer,
+        collinear along x with adjacent centres overlap_gap_px apart, symmetric
+        about the coverage centre. The gap is the ONLY variable, so eps1 is
+        tuned by lateral overlap alone -- the abscissa the dose-criterion
+        sweep needs."""
+        nl = layers.shape[0]
+        ny, nx = layers.shape[1], layers.shape[2]
+        gap = float(self.p.overlap_gap_px)
+        # strongest prepped particle is the shared template
+        k0, ebox0, Lm0, fb0 = max(
+            prepped, key=lambda t: float(np.abs(t[2].imag).max()))
+        patch, foot = Lm0, fb0
+        h, w = foot.shape
+        r_copy = self._copy_radius(foot)
+        yy, xx = np.nonzero(foot)
+        fcy, fcx = yy.mean(), xx.mean()
+
+        cov = self._coverage().cpu().numpy()
+        ys, xs = np.nonzero(cov)
+        ccy = int(round(0.5 * (ys.min() + ys.max())))
+        ccx = int(round(0.5 * (xs.min() + xs.max())))
+
+        placed, table = [], []
+        for j in range(nl):
+            cyv = ccy
+            cxv = ccx + int(round((j - (nl - 1) / 2.0) * gap))
+            y0 = min(max(cyv - h // 2, 0), ny - h)
+            x0 = min(max(cxv - w // 2, 0), nx - w)
+            dst = (slice(y0, y0 + h), slice(x0, x0 + w))
+            layers[j][dst] *= np.exp(s_pow * patch)
+            cy_a, cx_a = y0 + fcy, x0 + fcx
+            placed.append((float(cy_a), float(cx_a), r_copy, j))
+            table.append(dict(label=int(k0), layer=j, dy=0, dx=0,
+                              area=int(foot.sum()), cy=float(cy_a),
+                              cx=float(cx_a), scale=1.0, angle=0.0))
+
+        fr = self.rows[:, self.fny // 2].cpu().numpy()
+        fc = self.cols[:, self.fnx // 2].cpu().numpy()
+        self._verify_sparsity(placed, R, z_sim, fr, fc)
+        dev = np.abs(layers - 1.0)
+        logger.info(
+            "collinear overlap placement: gap %.0f px on %d layers, "
+            "adjacent shear %.0f px, max |O-1| = %.3f"
+            % (gap, nl, shear_px[0][1] if nl > 1 else 0.0, dev.max()))
         return layers, table
 
     # ------------------------------------------------------------------ #

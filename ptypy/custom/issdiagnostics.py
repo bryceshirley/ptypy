@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-First Born vs multislice diagnostics, as a ptypy engine.
+ISS vs multislice diagnostics, as a ptypy engine.
 
 WHAT THIS IS
 ------------
@@ -66,7 +66,7 @@ Take the reconstruction script, drop every optimisation parameter, point
 `ground_truth` at the rec/ folder and set numiter = 1. See the companion
 run_born_diagnostics.py.
 
-    p.engines.engine00.name = 'FirstBornDiagnostics'
+    p.engines.engine00.name = 'ISSDiagnostics'
     p.engines.engine00.numiter = 1
     p.engines.engine00.ground_truth = out_dir_rec
     p.engines.engine00.number_of_slices = 2
@@ -331,15 +331,15 @@ def _read_ptyr(fpath):
 # ===========================================================================
 
 @register()
-class FirstBornDiagnostics(stochastic.EPIE):
+class ISSDiagnostics(stochastic.EPIE):
     """
-    Read-only engine: compare the first-Born and multislice forward models on a
+    Read-only engine: compare the ISS and multislice forward models on a
     finished reconstruction, write the numbers and the figures, and stop.
 
     Defaults:
 
     [name]
-    default = FirstBornDiagnostics
+    default = ISSDiagnostics
     type = str
     help = Engine identifier
 
@@ -387,7 +387,7 @@ class FirstBornDiagnostics(stochastic.EPIE):
     doc = A results folder holds the same reconstruction at many iterations,
           and different engines converge at different rates, so a comparison
           across engines is only like for like at a fixed iteration. Setting
-          this to 500 compares the 500-iteration first-Born and 3PIE
+          this to 500 compares the 500-iteration ISS and 3PIE
           reconstructions and nothing else.
 
     [pair_mode]
@@ -405,7 +405,7 @@ class FirstBornDiagnostics(stochastic.EPIE):
     type = str
     help = Which reconstruction to analyse: a path, or a filename substring
     doc = A results folder can hold several reconstructions of the same scan at
-          the same iteration, e.g. a first-Born one and a 3PIE one. Give a
+          the same iteration, e.g. a ISS one and a 3PIE one. Give a
           substring such as 'threePIE' to pick one; the default takes the
           highest iteration. The probe is paired to it by whichever .ptyr in
           the folder best predicts the recorded data, so no naming convention
@@ -420,7 +420,7 @@ class FirstBornDiagnostics(stochastic.EPIE):
           recovered slices are compared with the primary reconstruction's. This
           is the control for the obvious objection to Sec. (xray): if eps_1 is
           the same for an object fitted with multislice as for one fitted with
-          first Born, it is a property of the specimen and not an artefact of
+          ISS, it is a property of the specimen and not an artefact of
           having fitted the object with the model under test.
 
     [number_of_slices]
@@ -543,7 +543,7 @@ class FirstBornDiagnostics(stochastic.EPIE):
     """
 
     def __init__(self, ptycho_parent, pars=None):
-        super(FirstBornDiagnostics, self).__init__(ptycho_parent, pars)
+        super(ISSDiagnostics, self).__init__(ptycho_parent, pars)
         self._done = False
         self._results = {}
 
@@ -553,7 +553,7 @@ class FirstBornDiagnostics(stochastic.EPIE):
     def engine_initialize(self):
         super().engine_initialize()
         if torch is None:
-            raise ImportError("FirstBornDiagnostics requires PyTorch")
+            raise ImportError("ISSDiagnostics requires PyTorch")
 
         N = int(self.p.number_of_slices)
         self.N = N
@@ -1012,7 +1012,7 @@ class FirstBornDiagnostics(stochastic.EPIE):
         """Find a (slice stack, probe) pair and score it against the data.
 
         A results folder can hold several reconstructions of the same scan at
-        the same iteration --- a first-Born one and a 3PIE one, say --- and
+        the same iteration --- a ISS one and a 3PIE one, say --- and
         several .ptyr dumps to go with them. Rather than trust a naming
         convention to pair them, every candidate probe is tried against the
         chosen slice stack and the pair that best predicts the recorded frames
@@ -1240,7 +1240,7 @@ class FirstBornDiagnostics(stochastic.EPIE):
 
             # --- the same hierarchy built on the tangent perturbation -----
             # 1 + i s_j = 1 + log O_j in place of O_j. Its M = 1 member is the
-            # tangent first Born; its M = N member is the full cascade with the
+            # tangent ISS; its M = N member is the full cascade with the
             # linearised slices,
             #     (1 + i s_{N-1}) P_d ... (1 + i s_1) P_d (1 + i s_0) P,
             # propagators and all -- an ordered product, not a pointwise one.
@@ -1492,7 +1492,7 @@ class FirstBornDiagnostics(stochastic.EPIE):
         return out
 
     def _precond_test(self, n=4, probes=4):
-        """Sec. (precond): the first-Born normal operator is exactly
+        """Sec. (precond): the ISS normal operator is exactly
         diag(|phi_j|^2). The multislice one is
         diag(conj psi_inc) T_{>j}^dag T_{>j} diag(psi_inc), which reduces to the
         same thing only when the downstream cascade is unitary, i.e. only when
@@ -1529,7 +1529,7 @@ class FirstBornDiagnostics(stochastic.EPIE):
                    downstream_modulus_min=float(mod.min()),
                    downstream_absorption=float(1.0 - mod.mean()))
         logger.info("preconditioner: ||T^dag T - I|| / ||I|| = %.3e at mean "
-                    "downstream |O| = %.4f (the first-Born normal operator is "
+                    "downstream |O| = %.4f (the ISS normal operator is "
                     "exactly diagonal regardless)"
                     % (out['nonunitarity'], out['downstream_modulus_mean']))
         return out
@@ -1683,7 +1683,7 @@ class FirstBornDiagnostics(stochastic.EPIE):
         """Transforms per position, forward plus adjoint, of Table 1.
 
         Multislice: 2(N-1) for the propagations plus one to the detector, and
-        the same again for the adjoint. First Born: N forward transforms, one
+        the same again for the adjoint. ISS: N forward transforms, one
         inverse for the accumulator and one for the detector, each way.
         """
         return dict(multislice=4 * N - 2, born=2 * (N + 2))
@@ -1828,7 +1828,7 @@ class FirstBornDiagnostics(stochastic.EPIE):
         N = self.N
         L = logger.info
         L("=" * 70)
-        L("First-Born truncation error, Eq. (epsilon)   [gauge: %s]"
+        L("ISS truncation error, Eq. (epsilon)   [gauge: %s]"
           % prim.get('gauge', '?'))
         L("=" * 70)
         mp = r['run'].get('slice_mean_phase_rad')
@@ -1838,7 +1838,7 @@ class FirstBornDiagnostics(stochastic.EPIE):
               "specimen" % np.round(mp, 3).tolist())
         for M, e in sorted(prim['eps_order'].items()):
             tag = ('unscattered only' if M == 0 else
-                   'Eq. (model), first Born' if M == 1 else
+                   'Eq. (model), ISS' if M == 1 else
                    'exact multislice, so round-off' if M == N else 'order <= %d' % M)
             et = prim.get('eps_order_tangent', {}).get(M)
             extra = ('   tangent %.4e' % et) if et is not None else ''
@@ -1872,7 +1872,7 @@ class FirstBornDiagnostics(stochastic.EPIE):
           % prim['eps1_spread_at_fixed_phi'])
         L("  corr[log eps_1, log sum_pairs <|g_j|><|g_k|>] = %.2f   "
           "(the overlap mechanism)" % prim['overlap_eps1_correlation'])
-        L("  first Born captures %.1f%% of the object's effect on the field "
+        L("  ISS captures %.1f%% of the object's effect on the field "
           "(1 - eps_1/eps_0)" % (100.0 * prim['fraction_captured']))
         L("  tangent floor: predicted (1/2) sum <phi_j^2> = %.4e, "
           "measured %.4e" % (prim['tangent_floor_estimate'],
@@ -1959,9 +1959,9 @@ class FirstBornDiagnostics(stochastic.EPIE):
             fig, ax = plt.subplots(figsize=(5.2, 4.0))
             p = np.asarray(d['overlap_per_pos'])
             ax.loglog(p, d['eps1_per_pos'], '.', ms=3, alpha=0.4,
-                      label=r'first Born, chord $g=O-1$')
+                      label=r'ISS, chord $g=O-1$')
             ax.loglog(p, d['eps1lin_per_pos'], '.', ms=3, alpha=0.4,
-                      color='crimson', label=r'first Born, tangent $g=is$')
+                      color='crimson', label=r'ISS, tangent $g=is$')
             ax.set_title('detector error of each model on the ground truth',
                          fontsize=9)
             ax.set_xlabel('probe-weighted inter-slice overlap')
@@ -2025,7 +2025,7 @@ class FirstBornDiagnostics(stochastic.EPIE):
                 a = axs[0]
                 Ms = sorted(d['eps_order'])
                 a.semilogy(Ms, [d['eps_order'][m] for m in Ms], 'o-', ms=4,
-                           label='primary (first Born fit)')
+                           label='primary (ISS fit)')
                 a.semilogy(Ms, [d['eps_order_tangent'][m] for m in Ms], 'X--',
                            ms=4, color='crimson', alpha=0.6,
                            label='primary, tangent')
@@ -2173,7 +2173,7 @@ class FirstBornDiagnostics(stochastic.EPIE):
         phi = self._illumination(self.pr_g)
         I_ms = (self._ff(self._ff_fw, self._multislice(O, self.pr_g)).abs() ** 2).sum(1)
         I_b = (self._ff(self._ff_fw, self._born(O - 1.0, self.pr_g, phi)).abs() ** 2).sum(1)
-        # tangent first Born: the same exit wave with the linearised
+        # tangent ISS: the same exit wave with the linearised
         # perturbation g = i s = log O, as in the eps scan
         I_t = (self._ff(self._ff_fw, self._born(torch.log(O), self.pr_g, phi)).abs() ** 2).sum(1)
         Im, mk = self.I[idx], self.mask[idx]
@@ -2192,8 +2192,8 @@ class FirstBornDiagnostics(stochastic.EPIE):
             nrm = LogNorm(vmin=max(top * 1e-6, 1e-3), vmax=max(top, 1e-2))
             for j, (img, ttl) in enumerate((
                     (ms, 'multislice'),
-                    (bn, 'first Born (chord)'),
-                    (tn, 'first Born (tangent)'))):
+                    (bn, 'ISS (chord)'),
+                    (tn, 'ISS (tangent)'))):
                 h = ax[i, j].imshow(np.maximum(img, 1e-6), norm=nrm, cmap='inferno')
                 if i == 0:
                     ax[i, j].set_title(ttl, fontsize=10)

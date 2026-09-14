@@ -1,5 +1,5 @@
 """
-Chord vs tangent first-Born reconstruction of NanoMAX scan 434.
+Chord vs tangent ISS reconstruction of NanoMAX scan 434.
 
 A copy of data/macros/ptycho/reconstruction_example.py with nothing but the
 engine block changed: the engine is selected on the command line, the
@@ -8,8 +8,8 @@ the two runs cannot overwrite each other. Everything else -- data block,
 geometry, illumination seed, batch size, probe support -- is identical, so
 the perturbation is the only variable.
 
-    python run_firstborn_100.py chord      # FirstBornTorch,        g = O - 1
-    python run_firstborn_100.py tangent    # FirstBornTangentTorch, g = i s
+    python run_firstborn_100.py chord      # ISSTorch,        g = O - 1
+    python run_firstborn_100.py tangent    # ISSTangentTorch, g = i s
 """
 
 import os
@@ -20,14 +20,14 @@ from ptypy.core import Ptycho
 from ptypy import utils as u
 from distutils.version import LooseVersion
 from mpi4py import MPI
-from ptypy.custom import firstborntorch  # registers both engines
+from ptypy.custom import isstorch  # registers both engines
 
 if LooseVersion(ptypy.version) >= LooseVersion('0.5.0'):
     ptypy.load_ptyscan_module("nanomax")
 
 tag = sys.argv[1] if len(sys.argv) >= 2 else 'chord'
-ENGINE = {'chord': 'FirstBornTorch',
-          'tangent': 'FirstBornTangentTorch'}[tag]
+ENGINE = {'chord': 'ISSTorch',
+          'tangent': 'ISSTangentTorch'}[tag]
 
 detector         = 'eiger4m'
 beamtime_basedir = '/home/dnz75396/ptypy/data/'

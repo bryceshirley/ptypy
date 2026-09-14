@@ -1,7 +1,7 @@
 """
-RAAR projection engine for the first Born (ISS) model.
+RAAR projection engine for the ISS (ISS) model.
 
-The first Born model is a multi-probe thin-sample problem: slice j pairs
+The ISS model is a multi-probe thin-sample problem: slice j pairs
 its own defocused probe phi_j = Prop_{z_j} P with its own perturbation
 g_j = O_j - 1, coupled only through the coherent detector sum and the
 shared probe. This engine runs RAAR in *branch space*: per view the
@@ -38,7 +38,7 @@ repurposed here with the RAAR meaning. Single MPI rank only.
 Defaults:
 
 [name]
-default = RAARFirstBornTorch
+default = RAARISSTorch
 type = str
 help = Engine identifier
 
@@ -126,7 +126,7 @@ help = Where the branch waves live; 'same' keeps them on p.device, 'cpu'
 import numpy as np
 
 from ptypy.custom import torch_helpers
-from ptypy.custom.firstborntorch import FirstBornTorch
+from ptypy.custom.isstorch import ISSTorch
 from ptypy.engines import register
 from ptypy.utils.verbose import logger
 
@@ -231,10 +231,10 @@ def raar_fourier_chunk(W, PO, a_det, fmag, fmask, pbound, coeffs,
 #  Engine
 # ===========================================================================
 @register()
-class RAARFirstBornTorch(FirstBornTorch):
+class RAARISSTorch(ISSTorch):
     __doc__ = __doc__
 
-    SUPPORTED_MODELS = FirstBornTorch.SUPPORTED_MODELS
+    SUPPORTED_MODELS = ISSTorch.SUPPORTED_MODELS
 
     def engine_initialize(self):
         super().engine_initialize()

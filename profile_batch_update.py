@@ -1,5 +1,5 @@
 """
-Throwaway profiler for FastFirstBornTorch._batch_update at production settings.
+Throwaway profiler for LSISSTorch._batch_update at production settings.
 
 Item 0 of the perf review: measure whether the batch is launch/sync-bound or
 FLOP-bound at the winning recipe (batch 1, N=10, M=2, 512x512, probe on).
@@ -26,7 +26,7 @@ try:
 except Exception:
     DeviceType = None
 
-from ptypy.custom.fastfirstborntorch import FastFirstBornTorch
+from ptypy.custom.lsisstorch import LSISSTorch
 
 WARMUP = 8                      # batches run untouched to reach steady state
 RUNNER = "/home/dnz75396/ptypy/run_fastborn_100um_het.py"
@@ -35,7 +35,7 @@ ARGV = ["run_fastborn_100um_het.py",
         "F1prof", "1", "1", "max", "0.5", "1", "10", "3", "100",
         "0", "0", "0.0", "stxm", "1", "0", "0", "625", "none", "0"]
 
-_orig = FastFirstBornTorch._batch_update
+_orig = LSISSTorch._batch_update
 _state = {"n": 0, "wall_ms": None}
 
 
@@ -91,7 +91,7 @@ def _report(prof, wall_ms):
     ratio = cuda_ms / wall_ms if wall_ms else float("nan")
 
     print("\n" + "=" * 72)
-    print("ITEM 0 PROFILE  -  FastFirstBornTorch._batch_update (B=1, N=10, M=2, 512x512)")
+    print("ITEM 0 PROFILE  -  LSISSTorch._batch_update (B=1, N=10, M=2, 512x512)")
     print("=" * 72)
     print("wall time (sync-bracketed) : %.3f ms" % wall_ms)
     print("CUDA kernel time (self)    : %.3f ms" % cuda_ms)
@@ -154,7 +154,7 @@ def _wrapped(self, idx):
     return _orig(self, idx)
 
 
-FastFirstBornTorch._batch_update = _wrapped
+LSISSTorch._batch_update = _wrapped
 
 if __name__ == "__main__":
     sys.argv = ARGV

@@ -1,6 +1,6 @@
 """
 Multislice (3PIE cascade) with exact per-slice line searches: the
-FastFirstBornTorch idea carried to the full ordered-product model.
+LSISSTorch idea carried to the full ordered-product model.
 
 WHY THIS CAN EXIST
 ------------------
@@ -50,7 +50,7 @@ ThreePIETorch iteration.
 
 import numpy as np
 
-from ptypy.custom.fastfirstborntorch import solve_step_cubic
+from ptypy.custom.lsisstorch import solve_step_cubic
 from ptypy.custom.threepietorch import ThreePIETorch
 from ptypy.engines import register
 from ptypy.utils.verbose import logger
@@ -77,7 +77,7 @@ class FastThreePIETorch(ThreePIETorch):
     default = 0.5
     type = float
     help = Multiplier on every exact step
-    doc = Same role as in FastFirstBornTorch: the exact minimiser of each
+    doc = Same role as in LSISSTorch: the exact minimiser of each
           batch's cost is too greedy across overlapping views, and half
           the exact step is the classic under-relaxation for cyclic
           solvers.

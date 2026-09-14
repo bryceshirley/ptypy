@@ -6,7 +6,7 @@ what, if anything, answers. A mixin listed *before* this class in the bases
 overrides one or more of them; with no such mixin the engine runs exactly as it
 would without the hooks at all.
 
-    class FirstBornTorch(stochastic.EPIE, SomeMixin, EngineHooks):
+    class ISSTorch(stochastic.EPIE, SomeMixin, EngineHooks):
 
 Method resolution puts SomeMixin ahead of EngineHooks, so its overrides win, and
 deleting it from the bases falls back to the no-ops here. That is the point: an
@@ -46,7 +46,7 @@ class EngineHooks:
 # travels to the others. The two forward models carry it differently, and that
 # difference is the measurement:
 #
-#   * First Born. The slices enter as an affine sum, so no slice sits in
+#   * ISS. The slices enter as an affine sum, so no slice sits in
 #     another's optical path and the per-slice normal operator is exactly
 #     diagonal. A bad slice reaches another slice's gradient only through the
 #     shared detector residual.
@@ -98,7 +98,7 @@ class SliceCorruptionMixin(EngineHooks):
     type = str
     help = Deliberately damage one slice: 'none', 'first', 'last' or an index
     doc = For measuring how far an error in one slice travels to the others. In
-          the first Born model only the shared residual carries it, because the
+          the ISS model only the shared residual carries it, because the
           operator is built from H_i and phi_i and contains no object. In
           multislice it travels through the operator as well, and
           asymmetrically: upstream it corrupts the illumination, downstream the

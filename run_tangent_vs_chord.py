@@ -3,8 +3,8 @@ Chord vs tangent Born reconstruction of the sparse strong 3-slice sim.
 
     python run_tangent_vs_chord.py <label> <chord|tangent> [niter] [batch]
 
-chord   -> FirstBornTorch         g = O - 1   (exact slice transmission)
-tangent -> FirstBornTangentTorch  g = i s     (linearised / weak-phase)
+chord   -> ISSTorch         g = O - 1   (exact slice transmission)
+tangent -> ISSTangentTorch  g = i s     (linearised / weak-phase)
 
 Everything else is identical between the two runs: same sim data, same
 truth probe injected and FROZEN (object-only reconstruction, so 3
@@ -22,7 +22,7 @@ from ptypy.core import Ptycho
 from ptypy import utils as u
 from distutils.version import LooseVersion
 from mpi4py import MPI
-from ptypy.custom import firstborntorch, fastfirstborntorch  # register engines
+from ptypy.custom import isstorch, lsisstorch  # register engines
 
 label = sys.argv[1] if len(sys.argv) >= 2 else 'test'
 kind  = sys.argv[2] if len(sys.argv) >= 3 else 'chord'
@@ -30,11 +30,17 @@ Niter = int(sys.argv[3]) if len(sys.argv) >= 4 else 3
 batch_size = int(sys.argv[4]) if len(sys.argv) >= 5 else 1
 # optional: an explicit sim directory, instead of the newest matching one
 sim_dir_arg = sys.argv[5] if len(sys.argv) >= 6 else None
+# probe handling: 'truth' (default) injects the simulation probe and
+# freezes it (object-only test); 'free' reconstructs the probe jointly
+# from the standard aperture+defocus init, as a real experiment would
+probe_mode = sys.argv[6] if len(sys.argv) >= 7 else 'truth'
+if probe_mode not in ('truth', 'free'):
+    raise SystemExit("probe mode (argv6) must be 'truth' or 'free'")
 
-engine_by_kind = {'chord': 'FirstBornTorch',
-                  'tangent': 'FirstBornTangentTorch',
-                  'fast': 'FastFirstBornTorch',
-                  'fasttangent': 'FastFirstBornTangentTorch'}
+engine_by_kind = {'chord': 'ISSTorch',
+                  'tangent': 'ISSTangentTorch',
+                  'fast': 'LSISSTorch',
+                  'fasttangent': 'LSISSTangentTorch'}
 if kind not in engine_by_kind:
     raise SystemExit("second argument must be 'chord', 'tangent', 'fast' "
                      "or 'fasttangent'")
@@ -198,32 +204,42 @@ if kind in ('tangent', 'fasttangent'):
     p.engines.engine00.potential_real = True
 p.engines.engine00.plot_interval = 1          # plot EVERY iteration
 p.engines.engine00.device = 'cuda'
-# truth probe, frozen for the whole run: object-only reconstruction
-p.engines.engine00.probe_update_start = Niter + 1
+if probe_mode == 'truth':
+    # truth probe, frozen for the whole run: object-only reconstruction
+    p.engines.engine00.probe_update_start = Niter + 1
+else:
+    # joint reconstruction: probe updated every batch from the aperture init
+    p.engines.engine00.probe_update_start = 0
 p.engines.engine00.fslices = (f'{out_dir_rec}rec_{sim_stem}'
                               f'_{kind}-{label}_iter-{Niter:0>4}.h5')
 
 if LooseVersion(ptypy.version) < LooseVersion('0.3.0'):
     raise Exception('Use ptypy 0.3.0 or better!')
 
-# build up to engine creation, then overwrite the probe storage with the
-# exact simulation probe from the truth h5, so the frozen probe IS truth
 import h5py
-P = Ptycho(p, level=4)
 truth_h5 = path_sim[:-5] + '_truth_iter-0000.h5'
-with h5py.File(truth_h5, 'r') as f:
-    Ptruth = f['content/probe/S00/data'][()]
-prs = next(iter(P.probe.storages.values()))
-if prs.data.shape != Ptruth.shape:
-    raise ValueError('truth probe shape %s != storage %s'
-                     % (Ptruth.shape, prs.data.shape))
-prs.data[:] = Ptruth.astype(prs.data.dtype)
-if comm.Get_rank() == 0:
-    print('[truth-probe] injected %s probe from %s; probe FROZEN; '
-          'engine = %s (%s perturbation)'
-          % (str(Ptruth.shape), os.path.basename(truth_h5), engine, kind))
-P.run()
-P.finalize()
+if probe_mode == 'truth':
+    # build up to engine creation, then overwrite the probe storage with the
+    # exact simulation probe from the truth h5, so the frozen probe IS truth
+    P = Ptycho(p, level=4)
+    with h5py.File(truth_h5, 'r') as f:
+        Ptruth = f['content/probe/S00/data'][()]
+    prs = next(iter(P.probe.storages.values()))
+    if prs.data.shape != Ptruth.shape:
+        raise ValueError('truth probe shape %s != storage %s'
+                         % (Ptruth.shape, prs.data.shape))
+    prs.data[:] = Ptruth.astype(prs.data.dtype)
+    if comm.Get_rank() == 0:
+        print('[truth-probe] injected %s probe from %s; probe FROZEN; '
+              'engine = %s (%s perturbation)'
+              % (str(Ptruth.shape), os.path.basename(truth_h5), engine, kind))
+    P.run()
+    P.finalize()
+else:
+    if comm.Get_rank() == 0:
+        print('[free-probe] probe reconstructed jointly from the aperture '
+              'init; engine = %s (%s perturbation)' % (engine, kind))
+    P = Ptycho(p, level=5)
 
 # standard results package: slice gallery, truth-vs-rec, depth correlation
 if comm.Get_rank() == 0:

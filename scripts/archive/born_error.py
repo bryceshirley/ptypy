@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-born_error.py -- measure the first-Born truncation error of a multislice
+born_error.py -- measure the ISS truncation error of a multislice
 ptychography reconstruction.
 
 WHAT THIS COMPUTES
@@ -29,9 +29,9 @@ Three families of numbers come out:
 
 It also computes the "Square of Errors" to isolate weak-phase vs truncation:
   - Exact Multislice (Baseline)
-  - First Born with exact g = O - 1 (Truncation error only)
+  - ISS with exact g = O - 1 (Truncation error only)
   - Multislice with tangent g = 1 + is (Weak-phase error only)
-  - First Born with tangent g = is (Combined error)
+  - ISS with tangent g = is (Combined error)
 
 USAGE
 -----
@@ -522,7 +522,7 @@ class BornErrorScan:
         blk_num = {b: 0.0 for b in blocks}
         blk_den = {b: 0.0 for b in blocks}
         born_num = born_den = 0.0
-        lin_num = lin_den = 0.0            # First Born with linearised transmission
+        lin_num = lin_den = 0.0            # ISS with linearised transmission
         ms_lin_num = ms_lin_den = 0.0      # Exact Multislice with linearised transmission
         lvb_num = lvb_den = 0.0            
         gre_num = gabs_num = gwgt = 0.0    
@@ -564,7 +564,7 @@ class BornErrorScan:
                     if not example:
                         example = self._example(F_ms, F_m, counts)
 
-            # --- independent first-Born evaluation, Eq. (model) -----------
+            # --- independent ISS evaluation, Eq. (model) -----------
             psi_b = born_exit(g, self.pr, phi, self.prop, self.z)
             F_b = self.det(psi_b)
             born_num += float(((F_ms - F_b).abs() ** 2).sum())
@@ -821,7 +821,7 @@ def plot_frame_comparison(scan, frames, prefix='eps', n=3, fftshift_data=False):
         c = _corr(ms, meas)
         panels = [(meas, 'measured (.ptyd)'),
                   (ms, 'multislice, corr %.3f' % c),
-                  (bn, 'first Born, Eq. (model)')]
+                  (bn, 'ISS, Eq. (model)')]
         for j, (img, title) in enumerate(panels):
             im = ax[i, j].imshow(np.maximum(img, 1e-12), norm=norm, cmap='inferno')
             ax[i, j].set_title(title if i == 0 else title.split(',')[0]
@@ -1151,7 +1151,7 @@ def _report(res: ScanResult):
     N = m['n_slices']
     print()
     print("=" * 68)
-    print("First-Born truncation error, Eq. (epsilon)")
+    print("ISS truncation error, Eq. (epsilon)")
     print("=" * 68)
     print("slices              : %d   z = %s (um)"
           % (N, np.round(np.array(m['z']) * 1e6, 4).tolist()))
@@ -1161,7 +1161,7 @@ def _report(res: ScanResult):
     print("  M    eps_M         interpretation")
     for M, e in sorted(res.eps_order.items()):
         tag = ('unscattered only' if M == 0 else
-               'Eq. (model), first Born' if M == 1 else
+               'Eq. (model), ISS' if M == 1 else
                'exact multislice' if M == N else 'order <= %d' % M)
         print("  %-4d %-13.4e %s" % (M, e, tag))
     print("  direct Born evaluation: %.4e  (should match M = 1)"
@@ -1273,7 +1273,7 @@ def _make_plots(res: ScanResult, prefix='eps'):
                    label='blocked, $g=O-1$')
     if m.get('eps_linearised'):
         a.semilogy([1], [m['eps_linearised']], 'X', ms=10, color='crimson',
-                   label=r'first Born, tangent $g=is$')
+                   label=r'ISS, tangent $g=is$')
     if m.get('eps_multislice_linearised'):
         a.semilogy([N], [m['eps_multislice_linearised']], '*', ms=10, color='purple',
                    label=r'multislice, tangent $g=is$')
@@ -1421,7 +1421,7 @@ def selftest(device='cpu', seed=0):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(
-        description='Measure the first-Born truncation error eps_M against '
+        description='Measure the ISS truncation error eps_M against '
                     'exact multislice for a ptychographic reconstruction. '
                     'Defaults are the NanoMAX two-slice geometry of the '
                     'offline reconstruction script (scan 434, crop 512, '

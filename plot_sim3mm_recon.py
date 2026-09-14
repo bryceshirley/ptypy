@@ -1,4 +1,4 @@
-"""30-slice (2.9 mm) sim: truth vs FastFirstBorn reconstruction figure.
+"""30-slice (2.9 mm) sim: truth vs LSISS reconstruction figure.
 
 Built from the existing run outputs only (no reconstruction is run):
 projected (depth-summed) phase of the truth stack and of the recovered stack,

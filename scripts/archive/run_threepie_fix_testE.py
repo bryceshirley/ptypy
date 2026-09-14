@@ -1,8 +1,8 @@
 """
-Test E: 20 iterations of FirstBornTorch, then ThreePIETorch warm-started
+Test E: 20 iterations of ISSTorch, then ThreePIETorch warm-started
 from its slices and probe, in one chained ptypy run.
 
-engine00 (FirstBornTorch) writes its slice stack to fslices at finalize and
+engine00 (ISSTorch) writes its slice stack to fslices at finalize and
 leaves its final probe in the probe container; engine01 (ThreePIETorch)
 reads the slices back through init_slices and inherits the probe from the
 container. The 3PIE stage runs with no stagger: the warm start replaces the
@@ -19,7 +19,7 @@ from ptypy.core import Ptycho
 from ptypy import utils as u
 from distutils.version import LooseVersion
 from mpi4py import MPI
-from ptypy.custom import threepietorch, firstborntorch
+from ptypy.custom import threepietorch, isstorch
 
 label      = 'E-fbinit'
 Niter_born = int(sys.argv[1]) if len(sys.argv) >= 2 else 20
@@ -101,9 +101,9 @@ p.scans.scan00.illumination.diversity.power = (1)
 
 p.engines = u.Param()
 
-# ---- stage 1: FirstBornTorch, same settings as the successful sim runs ----
+# ---- stage 1: ISSTorch, same settings as the successful sim runs ----
 p.engines.engine00 = u.Param()
-p.engines.engine00.name = 'FirstBornTorch'
+p.engines.engine00.name = 'ISSTorch'
 p.engines.engine00.precision = 'single'
 p.engines.engine00.object_denom = 'max'
 p.engines.engine00.numiter = Niter_born

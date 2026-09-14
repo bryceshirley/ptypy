@@ -1,5 +1,5 @@
 """
-First Born vs multislice diagnostics on a finished NanoMAX reconstruction.
+ISS vs multislice diagnostics on a finished NanoMAX reconstruction.
 
 This is the reconstruction script with every optimisation parameter removed.
 The data block is identical, because the whole point is that ptypy builds the
@@ -23,7 +23,7 @@ from ptypy.core import Ptycho
 from ptypy import utils as u
 from distutils.version import LooseVersion
 from mpi4py import MPI
-from ptypy.custom import borndiagnostics          # registers FirstBornDiagnostics
+from ptypy.custom import issdiagnostics          # registers ISSDiagnostics
 
 if LooseVersion(ptypy.version) >= LooseVersion('0.5.0'):
     ptypy.load_ptyscan_module("nanomax")
@@ -175,7 +175,7 @@ p.scans.scan00.illumination.diversity.power = (1)
 
 p.engines = u.Param()
 p.engines.engine00 = u.Param()
-p.engines.engine00.name = 'FirstBornDiagnostics'
+p.engines.engine00.name = 'ISSDiagnostics'
 p.engines.engine00.numiter = 1
 p.engines.engine00.numiter_contiguous = 1
 

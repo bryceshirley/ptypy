@@ -1,5 +1,5 @@
 """
-FirstBornTorch reconstruction of the simulated many-layer data.
+ISSTorch reconstruction of the simulated many-layer data.
 
 The data come from run_multislice_sim.py: exact multislice through a
 synthetic specimen built by scattering the reconstructed particles over
@@ -10,7 +10,7 @@ so the only change against the real-data run is the data itself.
 
 Ground truth for scoring the result:
     <out_dir_sim>/sim_slices-<N>_seed-<s>_truth_iter-0000.h5
-(fslices layout, readable with borndiagnostics._read_slices).
+(fslices layout, readable with issdiagnostics._read_slices).
 
     python run_firstborn_sim.py [niter]
 """
@@ -22,7 +22,7 @@ from ptypy.core import Ptycho
 from ptypy import utils as u
 from distutils.version import LooseVersion
 from mpi4py import MPI
-from ptypy.custom import threepietorch, firstborntorch, fastfirstborntorch     # registers FirstBornTorch
+from ptypy.custom import threepietorch, isstorch, lsisstorch     # registers ISSTorch
 
 detector         = 'eiger4m'
 beamtime_basedir = '/home/dnz75396/ptypy/data/'
@@ -191,7 +191,7 @@ p.scans.scan00.illumination.diversity.power = (1)
 
 p.engines = u.Param()
 p.engines.engine00 = u.Param()
-p.engines.engine00.name = 'FastFirstBornTorch'
+p.engines.engine00.name = 'LSISSTorch'
 p.engines.engine00.precision = 'single'
 p.engines.engine00.object_denom = 'local'
 p.engines.engine00.denom_reg = 0.05

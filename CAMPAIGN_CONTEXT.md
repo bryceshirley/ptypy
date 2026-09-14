@@ -262,6 +262,17 @@ to be less clean (sims favour the exact-multislice model).
   approximation; integration notes list the main.tex collisions (line ~1681
   "joint all-slice step", ~2614 "not implemented" — the layer-wise search
   now IS implemented) + naming ruling (line-search first Born, never Fast*).
+- JOINT PROBE+OBJECT confirmation (2026-09-14): run_tangent_vs_chord.py
+  argv7... argv6 probe mode 'truth'|'free'; 'free' reconstructs the probe
+  from the aperture+defocus init (probe_update_start=0). 50 it, per-slice
+  LS, batch 1, GPU, sim 203229: CHORD err 32 -> 0.023 MONOTONE (free probe
+  absorbs init mismatch — better than every frozen-probe control), object
+  dO corr 0.998/0.996/0.997, phases -4.9/-5.1/-5.0, probe intensity corr
+  0.9973 / subspace 0.968 / power gauge 0.78 (object 1.1x compensates).
+  TANGENT (s real): err hangs 12.1 (528x), object 0.708, probe corrupted
+  to 0.20x power / subspace 0.65 — model error leaks into the probe.
+  Headline figure + write-up updated to the free-probe 50-it runs
+  (fast50fp/ftan50fp).
 - Write-up: ~/draft_paper/SPARSE_STRONG_RESULTS.md with the three figures
   copied as sparse_chord_vs_tangent_recon.png, sparse_eps1_vs_overlap.png
   (full-scan diag 02), sparse_forward_frames.png (diag_quick 03, fixed

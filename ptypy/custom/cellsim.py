@@ -22,7 +22,7 @@ WHY THE GRID IS DENSE AND THE TRUTH IS SPARSE
 A first draft of this engine used three slices -- window, sample, window --
 and that was wrong for four reasons.
 
-1. COST. Table 3 of the paper puts the first-Born/multislice crossover at
+1. COST. Table 3 of the paper puts the ISS/multislice crossover at
    N ~ 3: below it the Born model is SLOWER (48.5 vs 42.2 ms at N=2). A
    three-slice demonstration would win on physics and lose on wall clock,
    which is the trap the N=2 X-ray section already fell into. At N = 10-20
@@ -115,7 +115,7 @@ class CellSimulator(multislicesim.MultisliceSimulator):
           0.5 makes adjacent slices near-degenerate (their difference
           approaches the exactly-null constant direction of Eq. 22) and
           wastes unknowns. 10-20 is the useful range on this geometry, and
-          it is also where Table 3 puts first Born ahead of multislice on
+          it is also where Table 3 puts ISS ahead of multislice on
           cost.
 
     [cell_span]
@@ -574,7 +574,7 @@ class CellSimulator(multislicesim.MultisliceSimulator):
 # stronger paper than either alone.
 #
 # THE CONTROL. Reconstruct each dataset three ways: SINGLE SLICE (the
-# projection approximation, i.e. what people do now), first Born at
+# projection approximation, i.e. what people do now), ISS at
 # n_slices, and multislice at n_slices. The single-slice run is the baseline
 # the method has to beat, and beating it is a far weaker requirement than
 # beating multislice -- which conveniently sidesteps the chi^2 result in
@@ -595,7 +595,7 @@ class CellSimulator(multislicesim.MultisliceSimulator):
 #
 # SPARSITY CHECK. With structure on 3 of 13 slices, ~94% of the C(N,2) cross
 # terms in Eq. (6) contain a g_k that is identically zero. Run the
-# borndiagnostics engine on the truth stack and confirm epsilon_1 comes out
+# issdiagnostics engine on the truth stack and confirm epsilon_1 comes out
 # far below the dense-stack estimate of Eq. (18) at the same Phi_tot. That
 # is the Sec. 5.4 sparse-support claim measured rather than asserted, and it
 # is the cleanest demonstration in the paper of when the truncation is

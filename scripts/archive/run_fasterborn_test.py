@@ -1,5 +1,5 @@
 """
-FasterFirstBornTorch (exact plane search) on the 10-slice sim data,
+FasterISSTorch (exact plane search) on the 10-slice sim data,
 against the same .ptyd as run_fastborn_test.py, so the two engines are
 directly comparable run for run.
 
@@ -14,8 +14,8 @@ from ptypy.core import Ptycho
 from ptypy import utils as u
 from distutils.version import LooseVersion
 from mpi4py import MPI
-from ptypy.custom import fasterfirstborntorch, fastfirstborntorch, \
-    firstborntorch, threepietorch
+from ptypy.custom import fasterisstorch, lsisstorch, \
+    isstorch, threepietorch
 
 label      = sys.argv[1]
 Niter      = int(sys.argv[2])
@@ -167,7 +167,7 @@ p.scans.scan00.illumination.diversity.power = (1)
 
 p.engines = u.Param()
 p.engines.engine00 = u.Param()
-p.engines.engine00.name = 'FasterFirstBornTorch'
+p.engines.engine00.name = 'FasterISSTorch'
 p.engines.engine00.precision = 'single'
 p.engines.engine00.object_denom = denom
 p.engines.engine00.numiter = Niter

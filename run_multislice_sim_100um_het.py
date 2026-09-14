@@ -67,7 +67,7 @@ number_of_slices = 2          # of the reconstruction being loaded
 slice_thickness  = 1580.e-6   # of the reconstruction being loaded
 
 # which reconstruction to simulate from
-engine_name      = 'FirstBornTorch'
+engine_name      = 'ISSTorch'
 iteration        = 100        # rec_crop-512_slices-*_iter-0100.h5
 slices_tag       = None       # substring picking one slice file, or None
 

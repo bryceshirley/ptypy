@@ -1,12 +1,12 @@
 """
-FastFirstBornTorch on the 10-slice sim data, against the same .ptyd the
+LSISSTorch on the 10-slice sim data, against the same .ptyd the
 other engines were tested on.
 
     python run_fastborn_test.py <label> <niter> <batch_size> [denom]
 
 denom defaults to 'local' -- with an exact line search the global scale of
 the direction is absorbed by the step, so the per-pixel 'local' shape is the
-natural preconditioner. Pass 'max' to mirror the FirstBornTorch baseline.
+natural preconditioner. Pass 'max' to mirror the ISSTorch baseline.
 """
 
 import os
@@ -17,7 +17,7 @@ from ptypy.core import Ptycho
 from ptypy import utils as u
 from distutils.version import LooseVersion
 from mpi4py import MPI
-from ptypy.custom import fastfirstborntorch, firstborntorch, threepietorch
+from ptypy.custom import lsisstorch, isstorch, threepietorch
 
 label      = sys.argv[1]
 Niter      = int(sys.argv[2])
@@ -169,7 +169,7 @@ p.scans.scan00.illumination.diversity.power = (1)
 
 p.engines = u.Param()
 p.engines.engine00 = u.Param()
-p.engines.engine00.name = 'FastFirstBornTorch'
+p.engines.engine00.name = 'LSISSTorch'
 p.engines.engine00.precision = 'single'
 p.engines.engine00.object_denom = denom
 p.engines.engine00.numiter = Niter

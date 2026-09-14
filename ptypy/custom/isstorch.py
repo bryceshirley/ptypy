@@ -1,5 +1,5 @@
 """
-First Born multislice engine for ptychography.
+ISS multislice engine for ptychography.
 
 FORWARD MODEL
 -------------
@@ -66,7 +66,7 @@ def first_born_step(
     phi=None,
 ):
     """
-    Pure mathematical core for First Born Multislice Ptychography.
+    Pure mathematical core for ISS Multislice Ptychography.
 
     Returns raw gradients and preconditioners for external scattering
     into a global object space (used by ptypy).
@@ -224,17 +224,17 @@ def first_born_step_lowmem(
 
 
 # ---------------------------------------------------------------------------#
-#  First Born Engine wrapper                                                 #
+#  ISS Engine wrapper                                                 #
 # ---------------------------------------------------------------------------#
 @register()
-class FirstBornTorch(stochastic.EPIE, EngineHooks):
+class ISSTorch(stochastic.EPIE, EngineHooks):
     """
-    First Born multislice ptychography on the GPU.
+    ISS multislice ptychography on the GPU.
 
     Defaults:
 
     [name]
-    default = FirstBornTorch
+    default = ISSTorch
     type = str
     help = Engine identifier
 
@@ -410,7 +410,7 @@ class FirstBornTorch(stochastic.EPIE, EngineHooks):
     def engine_initialize(self):
         super().engine_initialize()
         if torch is None:
-            raise ImportError("FirstBornTorch requires PyTorch")
+            raise ImportError("ISSTorch requires PyTorch")
 
         N = self.p.number_of_slices
         want = str(self.p.device)
@@ -923,7 +923,7 @@ class FirstBornTorch(stochastic.EPIE, EngineHooks):
         logger.info(f"saving slices to {self.p.fslices}")
         io.h5write(
             self.p.fslices,
-            header={"description": "First Born multislice"},
+            header={"description": "ISS multislice"},
             content=info,
         )
 
@@ -933,13 +933,13 @@ class FirstBornTorch(stochastic.EPIE, EngineHooks):
 
 
 @register()
-class FirstBornTangentTorch(FirstBornTorch):
+class ISSTangentTorch(ISSTorch):
     """
-    First Born with the tangent (linearised-transmission) perturbation.
+    ISS with the tangent (linearised-transmission) perturbation.
 
     The chord engine expands the cascade in g_j = O_j - 1, the full slice
     transmission. This variant uses the weak-phase convention of the prior
-    first-Born treatments instead: O_j ~ 1 + i s_j. The reconstructed unknown
+    ISS treatments instead: O_j ~ 1 + i s_j. The reconstructed unknown
     is the scattering potential s_j itself -- phase in its real part,
     absorption in its imaginary part -- and the factor i belongs to the
     forward model, which is handed g_j = i s_j. Updates are additive in s_j
@@ -953,7 +953,7 @@ class FirstBornTangentTorch(FirstBornTorch):
     Defaults:
 
     [name]
-    default = FirstBornTangentTorch
+    default = ISSTangentTorch
     type = str
     help = Engine identifier
 

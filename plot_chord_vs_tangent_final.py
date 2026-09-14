@@ -4,8 +4,8 @@ Composite result figure: chord vs tangent line-search reconstructions.
     python plot_chord_vs_tangent_final.py <sim_dir> <chord_label> <tan_label> \
         <chord_log> <tan_log>
 
-Top: phase of the three layers, rows = ground truth / first Born (chord) /
-first Born (tangent), one shared grayscale (sequential: lightness carries
+Top: phase of the three layers, rows = ground truth / ISS (chord) /
+ISS (tangent), one shared grayscale (sequential: lightness carries
 the phase magnitude). Bottom: both engines' Fourier-error histories on one
 log axis (categorical: blue = chord, orange = tangent, the validated
 reference-palette pair).
@@ -65,8 +65,8 @@ pad = 60
 win = (slice(max(ys.min() - pad, 0), ys.max() + pad),
        slice(max(xs.min() - pad, 0), xs.max() + pad))
 
-rows = [('ground truth', truth), ('first Born, chord $g=O-1$', rec_c),
-        ('first Born, tangent $g=is$, $s$ real', rec_t)]
+rows = [('ground truth', truth), ('ISS, chord $g=O-1$', rec_c),
+        ('ISS, tangent $g=is$, $s$ real', rec_t)]
 
 
 def unwrapped(arr, L):
@@ -84,8 +84,8 @@ ph = [[unwrapped(arr, L) for L in range(3)] for _, arr in rows]
 # artifacts are visible; the deep truth/chord particles saturate (their
 # minima are direct-labeled per panel)
 tan_all = np.concatenate([p.ravel() for p in ph[2]])
-vmin = float(np.percentile(tan_all, 0.2))
-vmax = float(np.percentile(tan_all, 99.8))
+v = float(np.percentile(np.abs(tan_all), 98.0))
+vmin, vmax = -v, v
 
 fig = plt.figure(figsize=(10.5, 13.2), facecolor=SURFACE)
 gs = GridSpec(4, 3, figure=fig, height_ratios=[1, 1, 1, 0.85],
@@ -105,7 +105,9 @@ for r, (name, _) in enumerate(rows):
             ax.set_ylabel(name, fontsize=10, color=INK)
         # selective direct label: the deepest phase in this panel
         ax.text(0.03, 0.04, 'min %.2f rad' % ph[r][c].min(),
-                transform=ax.transAxes, fontsize=8, color=INK2)
+                transform=ax.transAxes, fontsize=8, color=INK,
+                bbox=dict(facecolor=SURFACE, alpha=0.8, edgecolor='none',
+                          pad=1.5))
 cax = fig.add_axes([0.915, 0.40, 0.018, 0.5])
 cb = fig.colorbar(im, cax=cax)
 cb.set_label('unwrapped phase [rad]', color=INK)
@@ -135,7 +137,7 @@ axl.legend(fontsize=10, frameon=False, labelcolor=INK,
            loc='center right')
 
 fig.suptitle('Sparse strong pure-phase specimen (3 layers): '
-             'chord vs tangent first Born', fontsize=13, color=INK)
+             'chord vs tangent ISS', fontsize=13, color=INK)
 out = sim_dir + 'chord_vs_tangent_final.png'
 fig.savefig(out, dpi=170, facecolor=SURFACE)
 print('figure:', out)

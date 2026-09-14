@@ -1,5 +1,5 @@
 """
-Tests for the first Born multislice engine and the helpers it shares with
+Tests for the ISS multislice engine and the helpers it shares with
 ThreePIETorch.
 
 The suite is in three layers:
@@ -41,7 +41,7 @@ except ImportError:
 
 if HAVE_TORCH:
     from ptypy.custom import torch_helpers
-    from ptypy.custom.firstborntorch import first_born_step
+    from ptypy.custom.isstorch import first_born_step
 
 
 # ---------------------------------------------------------------------------
@@ -335,7 +335,7 @@ class FirstBornEngineTest(unittest.TestCase):
     """
 
     def setUp(self):
-        self.outpath = tempfile.mkdtemp(suffix="firstborntorch_test")
+        self.outpath = tempfile.mkdtemp(suffix="isstorch_test")
 
     def tearDown(self):
         shutil.rmtree(self.outpath)
@@ -343,7 +343,7 @@ class FirstBornEngineTest(unittest.TestCase):
     @staticmethod
     def _pars(numiter=20, nslices=1, **kw):
         p = u.Param()
-        p.name = "FirstBornTorch"
+        p.name = "ISSTorch"
         p.numiter = numiter
         p.number_of_slices = nslices
         p.slice_thickness = 1e-6
@@ -448,7 +448,7 @@ class FirstBornEngineTest(unittest.TestCase):
     def test_recovers_the_moonflower_object(self):
         """
         Thresholds are calibrated against the stock engines on this same data:
-        at 20 iterations FirstBornTorch scores 0.90, DM 0.94 and EPIE 0.73.
+        at 20 iterations ISSTorch scores 0.90, DM 0.94 and EPIE 0.73.
         """
         self.assertGreater(
             self._object_fidelity(self._run()), 0.8,

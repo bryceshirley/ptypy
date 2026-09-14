@@ -1,9 +1,9 @@
 """
-First Born multislice with exact line searches, exploiting the affine model.
+ISS multislice with exact line searches, exploiting the affine model.
 
 WHY THIS CAN EXIST
 ------------------
-The first Born exit field is AFFINE in the slices and LINEAR in the probe:
+The ISS exit field is AFFINE in the slices and LINEAR in the probe:
 
     psi(g + a d, P) = psi(g, P) + a * dpsi_o        (dpsi_o independent of a)
     psi(g, P + b q) = psi(g, P) + b * dpsi_p        (dpsi_p independent of b)
@@ -31,7 +31,7 @@ the field after the object update is F + a D elementwise -- no re-evaluation
 updated field. The bilinear object-probe cross term is thereby handled
 exactly, which no fixed-step simultaneous update does.
 
-WHAT CHANGES AGAINST FirstBornTorch
+WHAT CHANGES AGAINST ISSTorch
 -----------------------------------
 Directions are the same preconditioned gradients as the parent's; only the
 step sizes differ: alpha/N and beta/N are replaced by the exact minimisers.
@@ -46,7 +46,7 @@ object step, 2x when the probe updates too.
 
 import numpy as np
 
-from ptypy.custom.firstborntorch import FirstBornTorch
+from ptypy.custom.isstorch import ISSTorch
 from ptypy.engines import register
 from ptypy.utils.verbose import logger
 
@@ -82,14 +82,14 @@ def solve_step_cubic(c0, c1, c2, c3, Qfun, fallback):
 
 
 @register()
-class FastFirstBornTorch(FirstBornTorch):
+class LSISSTorch(ISSTorch):
     """
-    First Born multislice with closed-form exact line searches.
+    ISS multislice with closed-form exact line searches.
 
     Defaults:
 
     [name]
-    default = FastFirstBornTorch
+    default = LSISSTorch
     type = str
     help = Engine identifier
 
@@ -158,7 +158,7 @@ class FastFirstBornTorch(FirstBornTorch):
     default = False
     type = bool
     help = Project the probe onto |FF{P}| = sqrt(<I>) each probe update, keep phase
-    doc = The bilinear First Born model makes the average diffraction pattern
+    doc = The bilinear ISS model makes the average diffraction pattern
           <I> = mean_j |FF{exit_j}|^2 measure the probe far-field amplitude
           directly (object cross-terms average out), the same quantity the
           'stxm' illumination init back-propagates. A good init alone does not
@@ -547,12 +547,12 @@ class FastFirstBornTorch(FirstBornTorch):
 
 
 @register()
-class FastFirstBornTangentTorch(FastFirstBornTorch):
+class LSISSTangentTorch(LSISSTorch):
     """
-    Exact-line-search first Born with the tangent (linearised) perturbation.
+    Exact-line-search ISS with the tangent (linearised) perturbation.
 
-    Same relationship to FastFirstBornTorch as FirstBornTangentTorch has to
-    FirstBornTorch: the reconstructed unknown is the scattering potential s
+    Same relationship to LSISSTorch as ISSTangentTorch has to
+    ISSTorch: the reconstructed unknown is the scattering potential s
     with g = i s, the gradient direction picks up the -i chain-rule factor
     (projected onto the reals when potential_real), and the line search runs
     along the MODEL direction i d via _dir_to_model. Because the field is
@@ -564,7 +564,7 @@ class FastFirstBornTangentTorch(FastFirstBornTorch):
     Defaults:
 
     [name]
-    default = FastFirstBornTangentTorch
+    default = LSISSTangentTorch
     type = str
     help = Engine identifier
 
@@ -573,7 +573,7 @@ class FastFirstBornTangentTorch(FastFirstBornTorch):
     type = bool
     help = Constrain the potential s to be real, i.e. a pure phase object
     doc = The strict weak-phase-object convention, as in
-          FirstBornTangentTorch: g = i s with s real forbids absorption and
+          ISSTangentTorch: g = i s with s real forbids absorption and
           locks the scattered wave in quadrature with the transmitted beam.
     """
 

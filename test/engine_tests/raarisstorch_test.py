@@ -1,5 +1,5 @@
 """
-Tests for the RAAR first Born (ISS) projection engine.
+Tests for the RAAR ISS (ISS) projection engine.
 
 Three layers:
 
@@ -30,9 +30,9 @@ except ImportError:
     HAVE_TORCH = False
 
 if HAVE_TORCH:
-    from ptypy.custom.raarfirstborntorch import (
+    from ptypy.custom.raarisstorch import (
         branch_detector_field, branch_back, raar_fourier_chunk)
-    import ptypy.custom.raarfirstborntorch  # noqa: F401
+    import ptypy.custom.raarisstorch  # noqa: F401
 
 
 def _setup(B=3, N=3, M=2, n=32):
@@ -144,7 +144,7 @@ _COMMON = dict(
 
 
 def _torch_pars(**kw):
-    pars = u.Param(name="RAARFirstBornTorch", numiter=5, beta=0.9,
+    pars = u.Param(name="RAARISSTorch", numiter=5, beta=0.9,
                    number_of_slices=1, slice_thickness=1e-9,
                    device="cpu", precision="double", seed=1,
                    chunk_size=16, object_init="container",
@@ -168,7 +168,7 @@ class EquivalenceTest(unittest.TestCase):
                      probe_update_start=pus, overlap_max_iterations=omi,
                      **_COMMON)
         eng1 = by_name("RAAR")(P1, e1)
-        eng2 = by_name("RAARFirstBornTorch")(
+        eng2 = by_name("RAARISSTorch")(
             P2, _torch_pars(numiter=iters, probe_update_start=pus,
                             overlap_max_iterations=omi))
         for eng in (eng1, eng2):
@@ -215,7 +215,7 @@ class SmokeN2Test(unittest.TestCase):
         # large factor. (The numpy RAAR shows the same err_fmag plateau on
         # this data with the probe frozen; N = 2 ends slightly lower.)
         P = _make_ptycho("n2")
-        eng = by_name("RAARFirstBornTorch")(
+        eng = by_name("RAARISSTorch")(
             P, _torch_pars(numiter=30, number_of_slices=2,
                            slice_thickness=3e-4, probe_update_start=100000,
                            overlap_max_iterations=1, beta=0.75,

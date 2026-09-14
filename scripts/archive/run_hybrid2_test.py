@@ -1,7 +1,7 @@
 """
 Hybrid two-stage reconstruction on the 10-slice sim data:
 
-  stage A  FastFirstBornTorch ('local'), fastest initial descent, run to
+  stage A  LSISSTorch ('local'), fastest initial descent, run to
            its model-mismatch plateau;
   stage B  standard ThreePIETorch ('max', fixed ePIE step), warm-started
            from stage A's slice stack (init_slices) and probe (shared
@@ -19,8 +19,8 @@ from ptypy.core import Ptycho
 from ptypy import utils as u
 from distutils.version import LooseVersion
 from mpi4py import MPI
-from ptypy.custom import fastthreepietorch, fastfirstborntorch, \
-    firstborntorch, threepietorch
+from ptypy.custom import fastthreepietorch, lsisstorch, \
+    isstorch, threepietorch
 
 label      = sys.argv[1]
 NiterA     = int(sys.argv[2])
@@ -176,7 +176,7 @@ final_fslices = (f'{out_dir_rec}rec_{sim_stem}'
 p.engines = u.Param()
 # stage A: Born, fastest early descent
 p.engines.engine00 = u.Param()
-p.engines.engine00.name = 'FastFirstBornTorch'
+p.engines.engine00.name = 'LSISSTorch'
 p.engines.engine00.precision = 'single'
 p.engines.engine00.object_denom = 'local'
 p.engines.engine00.denom_reg = 0.05

@@ -28,7 +28,7 @@ from ptypy.core import Ptycho
 from ptypy import utils as u
 from distutils.version import LooseVersion
 from mpi4py import MPI
-from ptypy.custom import threepietorch, firstborntorch
+from ptypy.custom import threepietorch, isstorch
 
 label       = sys.argv[1]
 Niter       = int(sys.argv[2])

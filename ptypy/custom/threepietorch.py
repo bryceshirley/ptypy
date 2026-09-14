@@ -82,7 +82,7 @@ class ThreePIETorch(stochastic.EPIE, EngineHooks):
     type = str, NoneType
     help = Optional fslices .h5 to initialise the slice stack from
     doc = Path to a file in the fslices layout (content/objects/.../data),
-          as written by this engine, FirstBornTorch or the simulator's truth
+          as written by this engine, ISSTorch or the simulator's truth
           dump. Each stored slice is loaded into the corresponding working
           slice; the file must hold number_of_slices slices on the same
           object canvas. Written for warm-starting multislice ePIE from a
@@ -133,7 +133,7 @@ class ThreePIETorch(stochastic.EPIE, EngineHooks):
           divided once: the preconditioned mini-batch update, and the setting
           to use above batch_size = 1. 'unscattered' divides by sum_m |phi_i|^2
           with phi_i the probe propagated to slice i with no object in the way,
-          which is the first-Born engine's denominator; use it in both engines
+          which is the ISS engine's denominator; use it in both engines
           when comparing the two forward models, so that the comparison is not
           confounded by the preconditioner.
 
@@ -497,7 +497,7 @@ class ThreePIETorch(stochastic.EPIE, EngineHooks):
         return torch_helpers.apply_torch(spec, w)
 
     def _unscattered(self):
-        """sum_m |phi_i|^2, the first-Born denominator: the probe propagated to
+        """sum_m |phi_i|^2, the ISS denominator: the probe propagated to
         each slice with no object in the way. Cached until the probe moves."""
         if self._phi_cache is None:
             N = int(self.p.number_of_slices)

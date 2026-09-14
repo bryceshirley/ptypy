@@ -9,11 +9,11 @@ and placement enforcing beam-cone disjointness -- no scan position of the
 divergent probe illuminates particles on two different layers. The engine
 verifies that condition against every scan position and logs it.
 
-Purpose: on this specimen the chord perturbation g = O - 1 (FirstBornTorch)
+Purpose: on this specimen the chord perturbation g = O - 1 (ISSTorch)
 is exact despite the strong scattering, because every neglected cross term
 contains the product of two slices' perturbations inside one beam cone,
 which the placement makes zero. The tangent perturbation g = i s
-(FirstBornTangentTorch) still carries its O(s^2) per-slice linearisation
+(ISSTangentTorch) still carries its O(s^2) per-slice linearisation
 error, which sparsity cannot remove. Reconstruct with
 run_tangent_vs_chord.py afterwards.
 
@@ -58,7 +58,7 @@ number_of_slices = 2          # of the reconstruction being loaded
 slice_thickness  = 1580.e-6   # of the reconstruction being loaded
 
 # which reconstruction to simulate from
-engine_name      = 'FirstBornTorch'
+engine_name      = 'ISSTorch'
 iteration        = 100
 slices_tag       = None
 

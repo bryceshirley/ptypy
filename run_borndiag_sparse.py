@@ -3,15 +3,15 @@ Detector-plane forward-model errors through the sparse strong truth sample.
 
     python run_borndiag_sparse.py [sim_dir]
 
-Points FirstBornDiagnostics at a SparseStrongSimulator sim: the truth layer
+Points ISSDiagnostics at a SparseStrongSimulator sim: the truth layer
 stack is the "reconstruction under test", the truth probe is injected as the
 live probe, and the recorded frames are the sim's own exact-multislice
 intensities (noise off). The engine then measures, per scan position and
 aggregated, how well each forward model predicts those frames:
 
     eps_multislice          exact multislice      -> round-off (sanity)
-    eps_order[1]            chord first Born      g = O - 1
-    eps_order_tangent[1]    tangent first Born    g = i s = log O
+    eps_order[1]            chord ISS      g = O - 1
+    eps_order_tangent[1]    tangent ISS    g = i s = log O
     ... higher orders and both hierarchies' floors
 
 On a beam-cone-sparse specimen the chord eps_1 should fall to the model's
@@ -30,7 +30,7 @@ from ptypy.core import Ptycho
 from ptypy import utils as u
 from distutils.version import LooseVersion
 from mpi4py import MPI
-from ptypy.custom import borndiagnostics   # registers FirstBornDiagnostics
+from ptypy.custom import issdiagnostics   # registers ISSDiagnostics
 
 detector         = 'eiger4m'
 beamtime_basedir = '/home/dnz75396/ptypy/data/'
@@ -115,7 +115,7 @@ p.scans.scan00.illumination.diversity.power = (1)
 
 p.engines = u.Param()
 p.engines.engine00 = u.Param()
-p.engines.engine00.name = 'FirstBornDiagnostics'
+p.engines.engine00.name = 'ISSDiagnostics'
 p.engines.engine00.numiter = 1
 p.engines.engine00.numiter_contiguous = 1
 
