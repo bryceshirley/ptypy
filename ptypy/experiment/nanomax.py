@@ -1127,8 +1127,10 @@ class NanomaxContrast(NanomaxStepscanSep2019):
         else:
             # use what is explictly defined in the reconstruction script
             logger.info(f'Using the photon energy explicitly given in the reconstruction script')
-            self.meta.energy = self.info.energy
-        logger.info(f'Using a photon energy of {self.meta.energy[0]:.3f} eV')
+            # match the from-file branch, which yields a 1-element array so the
+            # log line and downstream geometry can index meta.energy[0]
+            self.meta.energy = np.array([self.info.energy], dtype=float)
+        logger.info(f'Using a photon energy of {self.meta.energy[0]:.3f} keV')
 
 
     def load(self, indices):

@@ -165,6 +165,30 @@ class ThreePIE(stochastic.EPIE):
 
         return super().engine_finalize()
 
+    def psi_update(self, view, exit_wave, i):
+        """
+        Correct the wave incident on slice `i`.
+
+        Maiden 2012 applies the same correction to the illumination at every
+        slice; only the wave entering slice 0 is the probe. The corrections at
+        i > 0 are the mechanism that carries the Fourier residual back up the
+        stack: leave psi_i uncorrected and back-propagating it to slice i-1
+        returns exactly that slice's own exit wave, so its increment is
+        identically zero and every slice above the last freezes -- not slowly,
+        but to propagator round-off (1.2e-8 after 20 views, against 1.07 for
+        the last slice). No number of iterations recovers it; the gradient is
+        zero, not small.
+
+        `probe_update_start` therefore gates only i == 0, which is still enough
+        to freeze the probe, since psi_0 is where the probe increment comes
+        from. At probe_update_start = 0, the default, this changes nothing.
+        """
+        if i > 0:
+            self._generic_probe_update(view, exit_wave,
+                                       a=self._pr_a, b=self._pr_b)
+        else:
+            self.probe_update(view, exit_wave)
+
     def multislice_update(self, view):
         """
         Performs one 'iteration' of 3PIE (multislice ePIE) for a single view.
@@ -199,7 +223,8 @@ class ThreePIE(stochastic.EPIE):
         # Object/probe update for the last slice
         if self.curiter >= self.p.slice_start_iteration[-1]:
             self.object_update(view, {pod.ID:self._exits[-1][pod.pr_view] for name, pod in view.pods.items()})
-            self.probe_update(view, {pod.ID:self._exits[-1][pod.pr_view] for name, pod in view.pods.items()})
+            self.psi_update(view, {pod.ID:self._exits[-1][pod.pr_view] for name, pod in view.pods.items()},
+                            self.p.number_of_slices - 1)
             for name, pod in view.pods.items():
                 self._object[-1][pod.ob_view] = pod.object
                 self._probe[-1][pod.pr_view] = pod.probe
@@ -220,7 +245,7 @@ class ThreePIE(stochastic.EPIE):
 
                 # Actual object/probe update
                 self.object_update(view, {pod.ID:self._exits[i][pod.pr_view] for name, pod in view.pods.items()})
-                self.probe_update(view, {pod.ID:self._exits[i][pod.pr_view] for name, pod in view.pods.items()})
+                self.psi_update(view, {pod.ID:self._exits[i][pod.pr_view] for name, pod in view.pods.items()}, i)
                 for name, pod in view.pods.items():
                     self._object[i][pod.ob_view] = pod.object
                     self._probe[i][pod.pr_view] = pod.probe

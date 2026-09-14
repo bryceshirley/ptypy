@@ -200,13 +200,37 @@ class SliceCorruptionMixin(EngineHooks):
         r = torch.randn((ny, nx), generator=gen, device=self.dev, dtype=torch.float32)
         sig = float(self.p.corrupt_smooth)
         if sig > 0:
-            fy = torch.fft.fftfreq(ny, device=self.dev)
-            fx = torch.fft.fftfreq(nx, device=self.dev)
+            # Double precision on purpose. The coarse end of the sweep is the
+            # interesting one -- a field at or beyond the shear a_c is the
+            # direction the data cannot see -- and that is where
+            # exp(-2 (pi sig)^2 k^2) underflows in float32: every mode reaches
+            # zero, the field returns as numerical dust, the guard below scales
+            # it to ~1e-5 rms, and the run logs a corruption it never applied.
+            # In float64 the same grid stays exact past sig = 7000 px.
+            fy = torch.fft.fftfreq(ny, device=self.dev, dtype=torch.float64)
+            fx = torch.fft.fftfreq(nx, device=self.dev, dtype=torch.float64)
             k2 = fy[:, None] ** 2 + fx[None, :] ** 2
             g = torch.exp(-2.0 * (np.pi * sig) ** 2 * k2)
-            r = torch.fft.ifft2(torch.fft.fft2(r.to(torch.complex64)) * g).real
+            # Drop DC and scale the filter by its largest surviving mode. The
+            # field is renormalised to unit rms below, so only the shape of g
+            # matters, and at sig ~ a_c the surviving modes are ~1e-17 of DC:
+            # left in, the inverse transform rounds them away against it and
+            # returns a constant.
+            g[0, 0] = 0.0
+            gmax = g.max()
+            if gmax > 0:
+                g = g / gmax
+            r = torch.fft.ifft2(torch.fft.fft2(r.to(torch.complex128)) * g).real
         r = r - r.mean()
-        return (r / r.std().clamp_min(1e-12)).to(self.rdt)
+        s = r.std()
+        if not torch.isfinite(s) or float(s) <= 0.0:
+            # Say so rather than corrupt by 0 and report that it happened.
+            logger.warning(
+                f"corrupt_smooth = {sig:g} px leaves no field on a "
+                f"{ny} x {nx} grid: nothing to apply"
+            )
+            return torch.zeros((ny, nx), device=self.dev, dtype=self.rdt)
+        return (r / s).to(self.rdt)
 
     def _apply_corruption(self):
         j = self._corrupt_index()

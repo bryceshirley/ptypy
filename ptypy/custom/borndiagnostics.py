@@ -36,8 +36,9 @@ WHAT IT MEASURES
     multislice for free, and M = N returns it to round-off, which is the
     end-to-end check that the whole pipeline is right.
 
-2.  The blocked truncation of Sec. "Blocked truncation", n_blocks = 1..N.
-    Identical to the order truncation at N = 2; the two differ from N = 3 up.
+2.  (removed 2026-09-13) The blocked truncation is no longer computed; the
+    [blocks] parameter is accepted but ignored, and _blocked stays for
+    external use.
 
 3.  The two perturbation choices of Sec. "The perturbation": the chord
     g_j = O_j - 1 used in this work, and the tangent g_j = i s_j = log O_j of
@@ -967,19 +968,32 @@ class FirstBornDiagnostics(stochastic.EPIE):
                                 % (os.path.basename(sl),
                                    os.path.basename(pt) if pt else 'live probe',
                                    cc))
-                    # Always the mean gauge here. Two reconstructions sit in
-                    # whatever gauge their engine drifted into (Eq. null-const
-                    # leaves it free), and eps, Phi_tot and |g| are all
-                    # measured from that offset, so comparing them in their own
-                    # gauges compares the offsets and not the specimens.
+                    # The as-reconstructed ("own") gauge first: engines drift
+                    # in the free per-slice mean (Eq. null-const), the drift
+                    # inflates Phi_tot, |g| and eps_1, and the size of that
+                    # inflation is itself a number the draft quotes as a
+                    # warning. Then the mean gauge, which is the only basis on
+                    # which two reconstructions compare.
+                    cov = self._coverage()
+                    own_means = [complex(self.ob_g[j][cov].mean().cpu())
+                                 for j in range(self.N)]
+                    own = self._scan('none')
                     self._apply_gauge('mean')
                     res = self._scan('mean')
                     res['gauge_used'] = 'mean'
+                    res['own_gauge'] = dict(
+                        slice_mean_phase_rad=[float(np.angle(a))
+                                              for a in own_means],
+                        slice_mean_modulus=[float(abs(a)) for a in own_means],
+                        eps1=float(own['eps_order'].get(1, np.nan)),
+                        eps_linearised=float(own['eps_linearised']),
+                        phi_tot_rms=float(own['phi_tot_rms']))
                     res['slices'] = sl
                     res['ptyr'] = pt
                     res['data_correlation'] = cc
                     res['object_vs_primary'] = self._object_difference(
                         primary_ob.cpu().numpy())
+                    self._fig_object_difference(str(tag), primary_ob)
                     self._results['compare_' + str(tag)] = res
                 except Exception as e:                      # noqa: BLE001
                     logger.warning("  comparison '%s' failed: %s" % (tag, e))
@@ -1172,12 +1186,9 @@ class FirstBornDiagnostics(stochastic.EPIE):
         """One pass over the scan, accumulating every error measure."""
         N = self.N
         mo = int(min(self.p.max_order, N))
-        blocks = self.p.blocks
-        if blocks is None:
-            blocks = list(range(1, N + 1))
-        elif isinstance(blocks, int):
-            blocks = [blocks]
-        blocks = sorted({int(b) for b in blocks if 1 <= int(b) <= N})
+        # blocked truncation removed from the results (2026-09-13); the
+        # [blocks] parameter is accepted but ignored
+        blocks = []
 
         B = int(self.p.batch_size)
         sel = np.arange(self.n_pos)
@@ -1185,21 +1196,16 @@ class FirstBornDiagnostics(stochastic.EPIE):
             sel = np.linspace(0, self.n_pos - 1, int(self.p.n_positions)).astype(int)
 
         onum, oden = np.zeros(mo + 1), np.zeros(mo + 1)
-        bnum = {b: 0.0 for b in blocks}
-        bden = {b: 0.0 for b in blocks}
         lnum = lden = lvb_n = lvb_d = 0.0
         # the same hierarchy built on the tangent perturbation
         lorder_num, lorder_den = np.zeros(mo + 1), np.zeros(mo + 1)
-        lblk_num = {b: 0.0 for b in blocks}
-        lblk_den = {b: 0.0 for b in blocks}
         msl_num = msl_den = 0.0             # its M = N member
         gre = gabs = gw = 0.0
         chi_ms = chi_b = chi_lin = npix = 0.0
         e1, e1l, phis = [], [], []
-        rad = None
+        gbars, ph2s = [], []
         example = None
 
-        phi = self._illumination(self.pr_g)          # once: object free
         pw = (self.pr_g.abs() ** 2).sum(0)
 
         counts = (float(self.p.counts) if self.p.counts
@@ -1221,11 +1227,13 @@ class FirstBornDiagnostics(stochastic.EPIE):
                 F_m = self._ff(self._ff_fw, cum)
                 d = F_ms - F_m
                 onum[m] += float((d.abs() ** 2).sum())
-                oden[m] += float((F_m.abs() ** 2).sum())
+                # relative to the exact multislice field (the reference), not the
+                # truncated one
+                oden[m] += float((F_ms.abs() ** 2).sum())
                 if m == 1:
                     F1 = F_m
                     pn = (d.abs() ** 2).sum(dim=(1, 2, 3))
-                    pd = (F_m.abs() ** 2).sum(dim=(1, 2, 3)).clamp_min(1e-30)
+                    pd = (F_ms.abs() ** 2).sum(dim=(1, 2, 3)).clamp_min(1e-30)
                     e1.append(np.sqrt((pn / pd).cpu().numpy()))
 
             del orders
@@ -1248,11 +1256,11 @@ class FirstBornDiagnostics(stochastic.EPIE):
                 F_m = self._ff(self._ff_fw, cum)
                 d = F_ms - F_m
                 lorder_num[m] += float((d.abs() ** 2).sum())
-                lorder_den[m] += float((F_m.abs() ** 2).sum())
+                lorder_den[m] += float((F_ms.abs() ** 2).sum())
                 if m == 1:
                     F_lin = F_m
                     pn = (d.abs() ** 2).sum(dim=(1, 2, 3))
-                    pd = (F_m.abs() ** 2).sum(dim=(1, 2, 3)).clamp_min(1e-30)
+                    pd = (F_ms.abs() ** 2).sum(dim=(1, 2, 3)).clamp_min(1e-30)
                     e1l.append(np.sqrt((pn / pd).cpu().numpy()))
             del orders_l
 
@@ -1260,16 +1268,7 @@ class FirstBornDiagnostics(stochastic.EPIE):
             # it is available even when max_order < N
             F_ms_lin = self._ff(self._ff_fw, psi_ms_lin)
             msl_num += float(((F_ms - F_ms_lin).abs() ** 2).sum())
-            msl_den += float((F_ms_lin.abs() ** 2).sum())
-
-            # blocked truncation on the tangent perturbation, for the same
-            # reason: within a block it is first Born in i s rather than in
-            # O - 1, so the block boundaries do not remove the residual either
-            for b in blocks:
-                F_lb = self._ff(self._ff_fw,
-                                self._blocked(torch.log(O), self.pr_g, b))
-                lblk_num[b] += float(((F_ms - F_lb).abs() ** 2).sum())
-                lblk_den[b] += float((F_lb.abs() ** 2).sum())
+            msl_den += float((F_ms.abs() ** 2).sum())
 
             lnum += float(((F_ms - F_lin).abs() ** 2).sum())
             lden += float((F_lin.abs() ** 2).sum())
@@ -1284,15 +1283,22 @@ class FirstBornDiagnostics(stochastic.EPIE):
 
 
 
-            for b in blocks:
-                F_b = self._ff(self._ff_fw, self._blocked(g, self.pr_g, b))
-                bnum[b] += float(((F_ms - F_b).abs() ** 2).sum())
-                bden[b] += float((F_b.abs() ** 2).sum())
 
 
             ph = torch.stack([torch.angle(O[j]) for j in range(N)]).sum(0)
             phis.append(np.sqrt(((ph ** 2 * pw[None]).sum(dim=(1, 2))
                                  / pw.sum().clamp_min(1e-30)).cpu().numpy()))
+
+            # per-position, per-slice probe-weighted statistics: <|g_j|> feeds
+            # the pair-overlap metric (the mechanism behind the eps_1 spread
+            # at fixed Phi), <phi_j^2> feeds the tangent-floor estimate
+            # (1/2) sum_j <phi_j^2>
+            wsum = pw.sum().clamp_min(1e-30)
+            gbars.append(((g.abs() * pw[None, None]).sum(dim=(2, 3))
+                          / wsum).cpu().numpy())
+            ph_j = torch.stack([torch.angle(O[j]) for j in range(N)])
+            ph2s.append(((ph_j ** 2 * pw[None, None]).sum(dim=(2, 3))
+                         / wsum).cpu().numpy())
 
             # against the data, under the real mask and at the recorded flux
             I_b = (F1.abs() ** 2).sum(1)
@@ -1310,8 +1316,7 @@ class FirstBornDiagnostics(stochastic.EPIE):
                     chi_lin += v
             npix += float(mk.sum())
 
-            if rad is None:
-                rad = self._radial(I_ms[0], I_b[0], Im[0], mk[0], counts)
+            if example is None:
                 example = self._example(I_ms, I_b, Im, mk, counts)
             del O, g, psi_ms, psi_ms_lin, cum
 
@@ -1320,27 +1325,79 @@ class FirstBornDiagnostics(stochastic.EPIE):
         phis = np.concatenate(phis)
         phi_rms = float(np.sqrt((phis ** 2).mean()))
 
+        # --- quantities the draft quotes but that were never computed -------
+        gbar = np.concatenate(gbars, axis=1)          # (N, n_pos)
+        ph2 = np.concatenate(ph2s, axis=1)            # (N, n_pos)
+        # pair-overlap metric: eps_1 at N=2 is exactly ||g_1 P[g_0 phi]|| up
+        # to normalisation, so the product of probe-weighted |g| levels is the
+        # per-position mechanism behind the spread at fixed Phi
+        overlap = np.zeros(gbar.shape[1])
+        for j in range(N):
+            for k in range(j + 1, N):
+                overlap += gbar[j] * gbar[k]
+
+        def _loglog_fit(x, y):
+            m = (x > 0) & (y > 0)
+            if m.sum() < 4:
+                return dict(exponent=float('nan'), prefactor=float('nan'))
+            c = np.polyfit(np.log(x[m]), np.log(y[m]), 1)
+            return dict(exponent=float(c[0]), prefactor=float(np.exp(c[1])))
+
+        pow_chord = _loglog_fit(phis, e1)              # draft: "Phi^2.1"
+        pow_tangent = _loglog_fit(phis, e1l)
+
+        # spread of eps_1 at (nearly) fixed Phi: the draft's "factor of five"
+        band = np.abs(phis - np.median(phis)) < 0.05 * np.median(phis)
+        spread = (float(np.percentile(e1[band], 95)
+                        / max(np.percentile(e1[band], 5), 1e-30))
+                  if int(band.sum()) >= 8 else float('nan'))
+        m = (e1 > 0) & (overlap > 0)
+        overlap_corr = (float(np.corrcoef(np.log(e1[m]),
+                                          np.log(overlap[m]))[0, 1])
+                        if int(m.sum()) >= 8 else float('nan'))
+
         eps_order = {m: float(np.sqrt(onum[m] / max(oden[m], 1e-300)))
                      for m in range(mo + 1)}
         out = dict(
             gauge=gauge,
             eps_order=eps_order,
-            eps_block={b: float(np.sqrt(bnum[b] / max(bden[b], 1e-300)))
-                       for b in blocks},
             eps_linearised=float(np.sqrt(lnum / max(lden, 1e-300))),
             eps_order_tangent={m: float(np.sqrt(lorder_num[m]
                                                 / max(lorder_den[m], 1e-300)))
                                for m in range(mo + 1)},
-            eps_block_tangent={b: float(np.sqrt(lblk_num[b]
-                                                / max(lblk_den[b], 1e-300)))
-                               for b in blocks},
             eps_multislice_tangent=float(np.sqrt(msl_num / max(msl_den, 1e-300))),
             eps_linearised_vs_born=float(np.sqrt(lvb_n / max(lvb_d, 1e-300))),
             g_real_gap=float(gre / max(gw, 1e-300)),
             g_mean_modulus=float(gabs / max(gw, 1e-300)),
             phi_tot_rms=phi_rms,
+            # Phi_tot is the rms of the SUMMED slice phase, so the per-slice rms
+            # is Phi/N when the slices are identical (phases add coherently) and
+            # Phi/sqrt(N) when they are independent (variances add). The chord
+            # residual at M = 1 is the sum over the C(N,2) pair terms g_j g_k:
+            #   correlated    C(N,2) (Phi/N)^2          = (1/2) Phi^2 (1 - 1/N)
+            #   decorrelated  sqrt(C(N,2)) (Phi^2/N)    = Phi^2 sqrt((N-1)/(2N))
+            # At N = 2 these are Phi^2/4 and Phi^2/2: correlated content is the
+            # SMALLER error, because splitting a fixed projected phase equally
+            # minimises the product. The decorrelated value saturates at
+            # Phi^2/sqrt(2) for large N; it does not decay.
             eps1_estimate_correlated=float(0.5 * phi_rms ** 2 * (1 - 1.0 / self.N)),
-            eps1_estimate_decorrelated=float(phi_rms ** 2 / (np.sqrt(2) * self.N)),
+            eps1_estimate_decorrelated=float(
+                phi_rms ** 2 * np.sqrt((self.N - 1) / (2.0 * self.N))),
+            # the draft's Eq. (eps1-decorr): valid as a large-N asymptote of
+            # the fixed-per-slice-phase pair model, NOT at N = 2, where that
+            # same model returns the correlated value Phi^2/4 -- kept so the
+            # draft's quoted number is reproducible while the text is fixed
+            eps1_estimate_decorrelated_asymptotic=float(
+                phi_rms ** 2 / (np.sqrt(2) * self.N)),
+            # draft Eq. (tangent-floor): (1/2) sum_j <phi_j^2>, probe weighted
+            tangent_floor_estimate=float(0.5 * ph2.mean(axis=1).sum()),
+            fraction_captured=float(
+                1.0 - eps_order.get(1, np.nan)
+                / max(eps_order.get(0, 1e-30), 1e-30)),
+            phi_powerlaw_chord=pow_chord,
+            phi_powerlaw_tangent=pow_tangent,
+            eps1_spread_at_fixed_phi=spread,
+            overlap_eps1_correlation=overlap_corr,
             counts_per_frame=counts,
             counts_per_pixel=counts / float(self.fny * self.fnx),
             counts_visible_above=float(1.0 / (4 * max(eps_order.get(1, 1e-30), 1e-30) ** 2)),
@@ -1348,7 +1405,11 @@ class FirstBornDiagnostics(stochastic.EPIE):
             chi2_born=float(chi_b / max(npix, 1)),
             chi2_linearised=float(chi_lin / max(npix, 1)),
             eps1_per_pos=e1, eps1lin_per_pos=e1l, phi_per_pos=phis,
-            radial=rad, example=example)
+            gbar_per_pos=gbar, overlap_per_pos=overlap,
+            example=example)
+        out['noise_visibility_factor'] = float(
+            np.sqrt(out['counts_per_pixel']
+                    / max(out['counts_visible_above'], 1e-30)))
         return out
 
     # -- structural tests ------------------------------------------------
@@ -1421,6 +1482,13 @@ class FirstBornDiagnostics(stochastic.EPIE):
                     "response crosses half its plateau near %.3g 1/m"
                     % (out['q_c'], _halfway(qs, ratio)))
         out['q_half'] = float(_halfway(qs, ratio))
+        out['q_half_over_qc'] = float(out['q_half'] / max(out['q_c'], 1e-30))
+        # the draft claims the suppression below q_c is linear in q: fit the
+        # log-log slope over the sub-q_c decade (1.0 = linear)
+        lo = (qs < 0.5 * out['q_c']) & (ratio > 0)
+        out['lowq_slope'] = (float(np.polyfit(np.log(qs[lo]),
+                                              np.log(ratio[lo]), 1)[0])
+                             if int(lo.sum()) >= 4 else float('nan'))
         return out
 
     def _precond_test(self, n=4, probes=4):
@@ -1453,8 +1521,11 @@ class FirstBornDiagnostics(stochastic.EPIE):
             dev.append(float(r.abs().pow(2).sum().sqrt()
                              / w.abs().pow(2).sum().sqrt().clamp_min(1e-30)))
         mod = torch.stack([O[j].abs() for j in range(1, self.N)])
+        # the draft attributes the nonunitarity to the VARIATION of |O| across
+        # the slice rather than to its mean; the std is the evidence
         out = dict(nonunitarity=float(np.mean(dev)),
                    downstream_modulus_mean=float(mod.mean()),
+                   downstream_modulus_std=float(mod.std()),
                    downstream_modulus_min=float(mod.min()),
                    downstream_absorption=float(1.0 - mod.mean()))
         logger.info("preconditioner: ||T^dag T - I|| / ||I|| = %.3e at mean "
@@ -1464,7 +1535,7 @@ class FirstBornDiagnostics(stochastic.EPIE):
         return out
 
     # -- small helpers ---------------------------------------------------
-    def _radial(self, I_ms, I_b, Im, mk, counts):
+    def _radial(self, I_ms, I_b, Im, mk, counts, I_t=None):
         """Radial profiles: where in q the truncation error actually lives."""
         ny, nx = self.fny, self.fnx
         yy, xx = np.mgrid[:ny, :nx]
@@ -1473,14 +1544,25 @@ class FirstBornDiagnostics(stochastic.EPIE):
         nb = min(cy, cx)
         ms = I_ms.cpu().numpy()
         bn = I_b.cpu().numpy()
+        mm = mk.cpu().numpy()
         me = (Im * mk).cpu().numpy()
-        sc = me.sum() / max(ms.sum(), 1e-30)
+        # One mask for everything: the scale factor compares masked sums, and
+        # every ring mean is a mean over the unmasked pixels of that ring.
+        # Masking only the measured frame dragged its rings down against the
+        # models wherever the detector has gaps.
+        sc = me.sum() / max((ms * mm).sum(), 1e-30)
+        cnt = np.maximum(np.bincount(r.ravel(), mm.ravel(),
+                                     minlength=nb + 1)[:nb], 1e-30)
+        series = [('multislice', ms * sc), ('born', bn * sc),
+                  ('measured', me), ('difference', np.abs(ms - bn) * sc)]
+        if I_t is not None:
+            tn = I_t.cpu().numpy()
+            series += [('tangent', tn * sc),
+                       ('difference_tangent', np.abs(ms - tn) * sc)]
         prof = {}
-        for k, a in (('multislice', ms * sc), ('born', bn * sc),
-                     ('measured', me), ('difference', np.abs(ms - bn) * sc)):
-            prof[k] = np.bincount(r.ravel(), a.ravel(),
-                                  minlength=nb + 1)[:nb] / np.maximum(
-                np.bincount(r.ravel(), minlength=nb + 1)[:nb], 1)
+        for k, a in series:
+            prof[k] = np.bincount(r.ravel(), (a * mm).ravel(),
+                                  minlength=nb + 1)[:nb] / cnt
         psz = _scalar(self.geom.psize)
         q = np.arange(nb) * psz / _scalar(self.geom.distance) / self.lam
         return dict(q=q.tolist(), **{k: v.tolist() for k, v in prof.items()})
@@ -1766,16 +1848,6 @@ class FirstBornDiagnostics(stochastic.EPIE):
               "M = N its residual is %.4e, the intra-slice linearisation error "
               "that no truncation order removes"
               % prim['eps_multislice_tangent'])
-        for b, e in sorted(prim['eps_block'].items()):
-            # Counting the pairs a block structure neglects, the same way
-            # Eq. (eps1-estimate) counts them, gives (1/2)Phi^2 (1/M - 1/N):
-            # it reduces to Eq. (eps1-estimate) at M = 1 and to zero at M = N.
-            # The draft's (1 - 1/M) does neither -- it vanishes at M = 1 and is
-            # largest at M = N, where the blocked model is exact.
-            pred = (0.5 * prim['phi_tot_rms'] ** 2 * (1.0 / b - 1.0 / N)
-                    if N > 1 else 0.0)
-            L("  %d block(s)  eps = %.4e   predicted %.4e = (1/2)Phi^2(1/M-1/N)%s"
-              % (b, e, pred, '   (= exact multislice)' if b >= N else ''))
         L("")
         L("Perturbation choice:")
         L("  chord   g = O - 1   eps_1 = %.4e" % prim['eps_order'].get(1, np.nan))
@@ -1784,8 +1856,35 @@ class FirstBornDiagnostics(stochastic.EPIE):
           % (prim['g_real_gap'], prim['g_mean_modulus']))
         L("")
         L("Phi_tot (probe weighted rms) = %.4f rad" % prim['phi_tot_rms'])
-        L("  correlated estimate   %.4e" % prim['eps1_estimate_correlated'])
-        L("  decorrelated estimate %.4e" % prim['eps1_estimate_decorrelated'])
+        L("  correlated estimate   (1/2) Phi^2 (1 - 1/N)    = %.4e"
+          % prim['eps1_estimate_correlated'])
+        L("  decorrelated estimate Phi^2 sqrt((N-1)/(2N))   = %.4e"
+          % prim['eps1_estimate_decorrelated'])
+        L("  draft Eq. (eps1-decorr)  Phi^2/(sqrt(2) N)     = %.4e   "
+          "(large-N asymptote only; not valid at N = 2)"
+          % prim['eps1_estimate_decorrelated_asymptotic'])
+        L("  (at N = 2 correlated slice content is the SMALLER error: an "
+          "equal split of a fixed projected phase minimises the pair product)")
+        pc_, pt_ = prim['phi_powerlaw_chord'], prim['phi_powerlaw_tangent']
+        L("  measured power law: eps_1 ~ Phi^%.2f (chord), Phi^%.2f (tangent)"
+          % (pc_['exponent'], pt_['exponent']))
+        L("  spread at fixed Phi (p95/p05 within +/-5%% of the median): %.1fx"
+          % prim['eps1_spread_at_fixed_phi'])
+        L("  corr[log eps_1, log sum_pairs <|g_j|><|g_k|>] = %.2f   "
+          "(the overlap mechanism)" % prim['overlap_eps1_correlation'])
+        L("  first Born captures %.1f%% of the object's effect on the field "
+          "(1 - eps_1/eps_0)" % (100.0 * prim['fraction_captured']))
+        L("  tangent floor: predicted (1/2) sum <phi_j^2> = %.4e, "
+          "measured %.4e" % (prim['tangent_floor_estimate'],
+                             prim.get('eps_multislice_tangent', np.nan)))
+        L("  truncation vs shot noise: visible by a factor %.1f in amplitude"
+          % prim['noise_visibility_factor'])
+        ds_ = r.get('depth_separability')
+        if ds_:
+            L("Depth sweep: half-plateau at %.2f q_c; low-q log-log slope "
+              "%.2f (linear suppression predicts 1.0)"
+              % (ds_.get('q_half_over_qc', np.nan),
+                 ds_.get('lowq_slope', np.nan)))
         L("")
         L("Dose: %.3g counts/frame, %.3g per pixel; truncation stays under the "
           "shot-noise floor up to %.3g counts in the brightest pixel"
@@ -1815,6 +1914,14 @@ class FirstBornDiagnostics(stochastic.EPIE):
                       + ', '.join('slice %d %.3f rel, %.3f rad rms'
                                   % (d['slice'], d['relative_difference'],
                                      d['phase_rms_rad']) for d in od))
+                og = v.get('own_gauge')
+                if og:
+                    L("      in its own gauge: slice mean phase %s rad, "
+                      "modulus %s, Phi_tot %.3g rad, eps_1 %.3g -- the gauge "
+                      "drift, not the specimen"
+                      % (np.round(og['slice_mean_phase_rad'], 3).tolist(),
+                         np.round(og['slice_mean_modulus'], 3).tolist(),
+                         og['phi_tot_rms'], og['eps1']))
             e_p = r.get('gauge_mean', prim)['eps_order'].get(1, np.nan)
             for k, v in comps.items():
                 e_c = v['eps_order'].get(1, np.nan)
@@ -1832,78 +1939,33 @@ class FirstBornDiagnostics(stochastic.EPIE):
         L("=" * 70)
 
     def _figures(self):
-        prim_key = 'gauge_none' if 'gauge_none' in self._results else \
-            [k for k in self._results if k.startswith('gauge_')][0]
+        # Follow the gauge _run_all promoted, as _report does: when the slices
+        # carry a large mean phase the mean gauge is primary, and figures drawn
+        # from gauge_none would not show the numbers the report quotes.
+        prim = self._results.get('primary_gauge')
+        prim_key = ('gauge_' + prim if prim else
+                    [k for k in self._results if k.startswith('gauge_')][0])
         d = self._results[prim_key]
         N = self.N
         od = self.outdir
 
-        # 1 -- truncation error
-        try:
-            fig, ax = plt.subplots(figsize=(5.2, 4.0))
-            Ms = sorted(d['eps_order'])
-            bs = sorted(d['eps_block'])
-            ax.semilogy(Ms, [d['eps_order'][m] for m in Ms], 'o-', ms=4,
-                        label=r'chord $g=O-1$')
-            # blocked and order truncation are the same object at N = 2 (only
-            # M = 1 and M = N exist), so drawing both is just a thicker line
-            if N > 2:
-                ax.semilogy(bs, [d['eps_block'][b] for b in bs], 's--', ms=4,
-                            label=r'blocked, chord')
-            if 'eps_order_tangent' in d:
-                Mt = sorted(d['eps_order_tangent'])
-                ax.semilogy(Mt, [d['eps_order_tangent'][m] for m in Mt], 'X-',
-                            color='crimson', ms=5, label=r'tangent $g=is$')
-                if N > 2:
-                    bt = sorted(d['eps_block_tangent'])
-                    ax.semilogy(bt, [d['eps_block_tangent'][b] for b in bt],
-                                'v--', color='crimson', ms=4, alpha=0.7,
-                                label=r'blocked, tangent')
-                ax.axhline(d['eps_multislice_tangent'], color='crimson', ls=':',
-                           lw=1, alpha=0.8)
-                ax.text(0.99, d['eps_multislice_tangent'],
-                        'floor: linearised cascade ',
-                        transform=ax.get_yaxis_transform(), ha='right',
-                        va='bottom', fontsize=7, color='crimson')
-            ax.set_xticks(sorted(set(Ms) | set(bs)))
-            ax.set_xlabel(r'truncation order $M$ / number of blocks')
-            ax.set_ylabel(r'$\epsilon_M$')
-            ax.set_title(r'truncation error, $N=%d$' % N)
-            if N <= 2:
-                ax.text(0.03, 0.05, 'at $N=2$ blocking and order truncation '
-                        'coincide', transform=ax.transAxes, fontsize=7,
-                        color='0.35')
-            ax.legend(fontsize=7)
-            ax.grid(alpha=0.3)
-            _save(fig, od, '01_truncation_error.png')
-        except Exception as e:      # noqa: BLE001
-            logger.warning("figure 1 failed: %s" % e)
+        # figure 1 (truncation error) removed from the results (2026-09-13)
 
-        # 2 -- eps_1 against Phi_tot, both perturbations
+        # 2 -- eps_1 against the inter-slice overlap, both perturbations.
+        # The paper plots against the overlap integral (the support argument
+        # of Sec. 2.1), not Phi_tot, and default log ticks: the labelled
+        # minor ticks collided.
         try:
             fig, ax = plt.subplots(figsize=(5.2, 4.0))
-            p = d['phi_per_pos']
+            p = np.asarray(d['overlap_per_pos'])
             ax.loglog(p, d['eps1_per_pos'], '.', ms=3, alpha=0.4,
-                      label=r'$g=O-1$')
+                      label=r'first Born, chord $g=O-1$')
             ax.loglog(p, d['eps1lin_per_pos'], '.', ms=3, alpha=0.4,
-                      color='crimson', label=r'$g=is$')
-            pp = np.linspace(max(p.min(), 1e-4), p.max(), 64)
-            ax.loglog(pp, 0.5 * pp ** 2 * (1 - 1.0 / N), 'k-',
-                      label=r'$\frac{1}{2}\Phi^2(1-1/N)$')
-            ax.loglog(pp, pp ** 2 / (np.sqrt(2) * N), 'k--',
-                      label=r'$\Phi^2/(\sqrt{2}N)$')
-            # Phi spans well under a decade, so there are no major ticks in
-            # range: label the minor ones plainly instead of leaving the axis
-            # bare or letting the default mantissa labels collide.
-            from matplotlib.ticker import ScalarFormatter, LogLocator
-            ax.xaxis.set_major_locator(LogLocator(subs=(1.0, 2.0, 3.0, 4.0,
-                                                        5.0, 6.0, 8.0)))
-            ax.xaxis.set_major_formatter(ScalarFormatter())
-            ax.xaxis.set_minor_formatter(ScalarFormatter())
-            ax.tick_params(axis='x', labelsize=7)
-            ax.set_xlabel(r'$\Phi_{\rm tot}$ (rad)')
-            ax.set_ylabel(r'$\epsilon_1$')
-            ax.set_title('per position, against the estimates')
+                      color='crimson', label=r'first Born, tangent $g=is$')
+            ax.set_title('detector error of each model on the ground truth',
+                         fontsize=9)
+            ax.set_xlabel('probe-weighted inter-slice overlap')
+            ax.set_ylabel(r'$\epsilon_1$ at the detector vs exact multislice')
             ax.legend(fontsize=7)
             ax.grid(alpha=0.3, which='both')
             _save(fig, od, '02_phi_scatter.png')
@@ -1916,27 +1978,7 @@ class FirstBornDiagnostics(stochastic.EPIE):
         except Exception as e:      # noqa: BLE001
             logger.warning("figure 3 failed: %s" % e)
 
-        # 4 -- radial profiles
-        try:
-            r = d['radial']
-            q = np.array(r['q'])
-            fig, ax = plt.subplots(figsize=(5.4, 4.0))
-            ax.loglog(q, np.maximum(r['measured'], 1e-12), 'k-', lw=1.2,
-                      label='measured')
-            ax.loglog(q, np.maximum(r['multislice'], 1e-12), '-', label='multislice')
-            ax.loglog(q, np.maximum(r['born'], 1e-12), '--', label='first Born')
-            ax.loglog(q, np.maximum(r['difference'], 1e-12), '-',
-                      color='crimson', label='|multislice - Born|')
-            ax.loglog(q, np.sqrt(np.maximum(r['measured'], 1e-12)), ':',
-                      color='0.5', label=r'shot noise $\sqrt{I}$')
-            ax.set_xlabel(r'$q$ (1/m)')
-            ax.set_ylabel('azimuthal mean intensity (counts)')
-            ax.set_title('where the truncation error lives')
-            ax.legend(fontsize=7)
-            ax.grid(alpha=0.3, which='both')
-            _save(fig, od, '04_radial_profiles.png')
-        except Exception as e:      # noqa: BLE001
-            logger.warning("figure 4 failed: %s" % e)
+        # figure 4 (radial profiles) removed from the results (2026-09-13)
 
         # 5 -- depth separability
         try:
@@ -2039,16 +2081,19 @@ class FirstBornDiagnostics(stochastic.EPIE):
 
                 a = axs[1]
                 if np.isfinite(bm['multislice_mem']).any():
+                    # The O(N) illumination cache is memory like any other, so
+                    # it is counted inside both Born curves rather than drawn
+                    # as a separate workspace-only line: both evaluation modes
+                    # hold it, and a Born curve without it understates the
+                    # engine's true footprint.
+                    il = np.array(bm.get('illumination_mem', []), dtype=float)
+                    il = (np.where(np.isfinite(il), il, 0.0)
+                          if il.size == Nb.size else 0.0)
                     a.loglog(Nb, bm['multislice_mem'], 'o-', ms=4, label='multislice')
-                    a.loglog(Nb, bm['born_parallel_mem'], 's-', ms=4,
-                             label='Born, parallel')
-                    a.loglog(Nb, bm['born_lowmem_mem'], '^-', ms=4,
-                             label='Born, low memory (workspace)')
-                    il = np.array(bm.get('illumination_mem', []))
-                    if il.size == Nb.size and np.isfinite(il).all():
-                        a.loglog(Nb, np.array(bm['born_lowmem_mem']) + il,
-                                 '^--', ms=4, alpha=0.6,
-                                 label='Born, low memory + illumination')
+                    a.loglog(Nb, np.array(bm['born_parallel_mem']) + il,
+                             's-', ms=4, label='Born, parallel')
+                    a.loglog(Nb, np.array(bm['born_lowmem_mem']) + il,
+                             '^-', ms=4, label='Born, low memory')
                     a.set_ylabel('peak allocation (GB)')
                 else:
                     a.text(0.5, 0.5, 'memory stats need CUDA', ha='center',
@@ -2074,6 +2119,50 @@ class FirstBornDiagnostics(stochastic.EPIE):
         except Exception as e:      # noqa: BLE001
             logger.warning("npz failed: %s" % e)
 
+    def _fig_object_difference(self, tag, primary_ob):
+        """The draft's reserved fig:objdiff: per slice, the primary phase, the
+        comparison phase and their difference, all in the mean gauge, cropped
+        to the illuminated region, on one colour scale for the phases and a
+        symmetric one for the difference. Called while self.ob_g holds the
+        comparison stack."""
+        try:
+            if tuple(self.ob_g.shape) != tuple(primary_ob.shape):
+                return
+            cov = self._coverage()
+            covn = cov.cpu().numpy()
+            ys, xs = np.where(covn)
+            y0, y1 = int(ys.min()), int(ys.max()) + 1
+            x0, x1 = int(xs.min()), int(xs.max()) + 1
+            N = int(self.ob_g.shape[0])
+            fig, ax = plt.subplots(N, 3, figsize=(10.8, 3.5 * N),
+                                   squeeze=False)
+            for j in range(N):
+                x = primary_ob[j].cpu().numpy()
+                y = self.ob_g[j].cpu().numpy()
+                x = x / x[covn].mean()
+                y = y / y[covn].mean()
+                d = np.angle(x * np.conj(y))
+                d = d - d[covn].mean()
+                px_, py_, dd = (np.angle(x)[y0:y1, x0:x1],
+                                np.angle(y)[y0:y1, x0:x1],
+                                d[y0:y1, x0:x1])
+                lo = min(np.percentile(px_, 1), np.percentile(py_, 1))
+                hi = max(np.percentile(px_, 99), np.percentile(py_, 99))
+                dm = float(np.percentile(np.abs(d[covn]), 99))
+                panels = ((px_, 'primary, slice %d' % j, 'Greys_r', lo, hi),
+                          (py_, '%s, slice %d' % (tag, j), 'Greys_r', lo, hi),
+                          (dd, 'phase difference', 'RdBu_r', -dm, dm))
+                for c, (img, ttl, cmap, vmin, vmax) in enumerate(panels):
+                    h = ax[j, c].imshow(img, cmap=cmap, vmin=vmin, vmax=vmax)
+                    ax[j, c].set_title(ttl, fontsize=9)
+                    ax[j, c].set_xticks([])
+                    ax[j, c].set_yticks([])
+                    fig.colorbar(h, ax=ax[j, c], fraction=0.046, pad=0.04,
+                                 label='rad' if c == 2 else '')
+            _save(fig, self.outdir, '09_object_difference_%s.png' % tag)
+        except Exception as e:              # noqa: BLE001
+            logger.warning("object-difference figure failed: %s" % e)
+
     def _fig_frames(self, od):
         n = int(self.p.compare_frames)
         if n < 1:
@@ -2084,28 +2173,39 @@ class FirstBornDiagnostics(stochastic.EPIE):
         phi = self._illumination(self.pr_g)
         I_ms = (self._ff(self._ff_fw, self._multislice(O, self.pr_g)).abs() ** 2).sum(1)
         I_b = (self._ff(self._ff_fw, self._born(O - 1.0, self.pr_g, phi)).abs() ** 2).sum(1)
+        # tangent first Born: the same exit wave with the linearised
+        # perturbation g = i s = log O, as in the eps scan
+        I_t = (self._ff(self._ff_fw, self._born(torch.log(O), self.pr_g, phi)).abs() ** 2).sum(1)
         Im, mk = self.I[idx], self.mask[idx]
 
-        fig, ax = plt.subplots(n, 4, figsize=(12.5, 3.1 * n), squeeze=False)
+        fig, ax = plt.subplots(n, 3, figsize=(9.5, 3.1 * n), squeeze=False)
+        fig.subplots_adjust(left=0.05, right=0.9, wspace=0.06)
         for i in range(n):
             me = (Im[i] * mk[i]).cpu().numpy()
             ms = I_ms[i].cpu().numpy()
             bn = I_b[i].cpu().numpy()
-            # one common scale factor, taken from multislice, applied to both
+            tn = I_t[i].cpu().numpy()
+            # one common scale factor, taken from multislice, applied to all
             sc = me.sum() / max((ms * mk[i].cpu().numpy()).sum(), 1e-30)
-            ms, bn = ms * sc, bn * sc
+            ms, bn, tn = ms * sc, bn * sc, tn * sc
             top = max(me.max(), ms.max())
             nrm = LogNorm(vmin=max(top * 1e-6, 1e-3), vmax=max(top, 1e-2))
             for j, (img, ttl) in enumerate((
-                    (me, 'measured'), (ms, 'multislice'),
-                    (bn, 'first Born'), (np.abs(ms - bn), '|multislice - Born|'))):
+                    (ms, 'multislice'),
+                    (bn, 'first Born (chord)'),
+                    (tn, 'first Born (tangent)'))):
                 h = ax[i, j].imshow(np.maximum(img, 1e-6), norm=nrm, cmap='inferno')
                 if i == 0:
                     ax[i, j].set_title(ttl, fontsize=10)
                 ax[i, j].set_xticks([]); ax[i, j].set_yticks([])
             ax[i, 0].set_ylabel('frame %d' % i, fontsize=9)
-            fig.colorbar(h, ax=ax[i, 3], fraction=0.046, pad=0.04)
-        fig.suptitle('measured and simulated, same position, same scale')
+            # dedicated colorbar axes OUTSIDE the grid: stealing space from
+            # a row axis shrank (or overlapped) the last panel
+            p = ax[i, 2].get_position()
+            cax = fig.add_axes([0.91, p.y0, 0.012, p.height])
+            fig.colorbar(h, cax=cax)
+        fig.suptitle('forward models through the ground truth, '
+                     'same position, same scale')
         _save(fig, od, '03_frames.png')
 
 

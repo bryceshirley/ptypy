@@ -23,17 +23,6 @@ PRECONDITIONING THE SLICE UPDATES
            sum_m |psi^inc_i|^2, with a floor of denom_reg times its maximum.
            Numerator and denominator are accumulated separately over the batch
            and divided once, which is the preconditioned mini-batch update.
-
-
-CORRUPTION
-----------
-`corrupt_slice` damages one slice on purpose, to measure how far the damage
-travels to the others. The parameters, the modes and the statistics live in
-`engine_hooks.SliceCorruptionMixin`, shared with the first-Born engine so
-that the two cannot drift apart -- the measurement is a difference between
-them, so anything differing other than the forward model is a confound. See
-that module for what the experiment is measuring and how to size the
-perturbation against the shear a_c = 2 NA dz.
 """
 
 import os
@@ -44,7 +33,7 @@ import numpy as np
 from ptypy import io
 from ptypy.core import geometry
 from ptypy.custom import torch_helpers
-from ptypy.custom.engine_hooks import EngineHooks, SliceCorruptionMixin
+from ptypy.custom.engine_hooks import EngineHooks
 from ptypy.engines import register, stochastic
 from ptypy.utils import Param
 from ptypy.utils.verbose import logger
@@ -56,13 +45,9 @@ except ImportError:  # pragma: no cover
 
 
 @register()
-class ThreePIETorch(stochastic.EPIE, SliceCorruptionMixin, EngineHooks):
+class ThreePIETorch(stochastic.EPIE, EngineHooks):
     """
     Batched GPU multislice ePIE.
-
-    The corrupt_* parameters and the machinery behind them come from
-    SliceCorruptionMixin, which attaches through the EngineHooks extension
-    points and can be dropped from the bases without touching this class.
 
     Defaults:
 
@@ -91,6 +76,18 @@ class ThreePIETorch(stochastic.EPIE, SliceCorruptionMixin, EngineHooks):
     default = slices.h5
     type = str
     help = Output path for the slice data
+
+    [init_slices]
+    default = None
+    type = str, NoneType
+    help = Optional fslices .h5 to initialise the slice stack from
+    doc = Path to a file in the fslices layout (content/objects/.../data),
+          as written by this engine, FirstBornTorch or the simulator's truth
+          dump. Each stored slice is loaded into the corresponding working
+          slice; the file must hold number_of_slices slices on the same
+          object canvas. Written for warm-starting multislice ePIE from a
+          cheaper engine's result. The probe is NOT read from this file --
+          seed it through the scan's illumination block (model = 'recon').
 
     [device]
     default = cuda
@@ -141,12 +138,49 @@ class ThreePIETorch(stochastic.EPIE, SliceCorruptionMixin, EngineHooks):
           confounded by the preconditioner.
 
     [denom_reg]
-    default = 0.01
+    default = 0.1
     type = float
     help = Floor on the 'local' and 'unscattered' denominators, as a fraction of the maximum
     doc = Ignored for 'max', which needs no regularisation. A focused probe has
           compact support and interior zeros, so the local denominator must be
           floored somewhere.
+
+    [obj_smooth_std]
+    default = None
+    type = float, NoneType
+    help = Gaussian smoothing (pixels) applied to each slice once per iteration
+    doc = None disables it. Same name and intent as the projectional engines'
+          obj_smooth_std: damp the spurious structure that accumulates where the
+          illumination barely reaches. It is applied as a blend weighted by
+          illumination coverage, not as a flat blur -- see obj_smooth_cover.
+
+    [obj_smooth_cover]
+    default = 0.1
+    type = float
+    help = Coverage at which the smoothing blend is half strength, as a fraction of the peak
+    doc = DM and RAAR smooth only the inertia term, so the blur competes against
+          sum|P|^2 and loses wherever the data has anything to say; that is why
+          obj_smooth_std = 20 does not destroy their resolution. A flat blur on
+          an ePIE object has no such competition and would. This reproduces the
+          projectional behaviour: with cov the accumulated sum|P|^2 and
+          c = obj_smooth_cover * cov.max(), the blend weight is c/(c + cov), so
+          a pixel at the peak of the coverage is left nearly alone, one at c is
+          half smoothed and the untouched border is smoothed fully.
+
+          The reference is the PEAK and not the median over cov > 0: a focused
+          probe has wings that reach numerical nonzero everywhere, so on real
+          data every pixel of the canvas is lit to some degree and a median over
+          them is a property of the wings rather than of the scan.
+
+    [clip_object]
+    default = None
+    type = tuple, list, NoneType
+    help = Clip slice amplitude into this interval, e.g. (0, 1)
+    doc = ptypy's clip_object, applied per slice once per iteration. A
+          non-amplifying sample has |O| <= 1, so (0, 1) is a physical statement
+          rather than a tuning knob -- though note that N slices whose product
+          must equal the true object can each legitimately exceed 1 when the
+          gauge drifts, so clip the product's worth, not less.
 
     [apply_probe_support]
     default = False
@@ -196,8 +230,9 @@ class ThreePIETorch(stochastic.EPIE, SliceCorruptionMixin, EngineHooks):
         self.ptycho.citations.add_article(**self.article)
 
         # Local time on purpose: this names a run directory the user reads.
+        # The class name is in it so a folder of runs identifies its solver.
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")  # noqa: DTZ005
-        self.plot_progress_dir = f"iteration_progress_{stamp}"
+        self.plot_progress_dir = f"iteration_progress_{type(self).__name__}_{stamp}"
         self._warned_inactive_last = False
 
     # ------------------------------------------------------------------ #
@@ -278,7 +313,7 @@ class ThreePIETorch(stochastic.EPIE, SliceCorruptionMixin, EngineHooks):
             raise ValueError("slice_start_iteration must have length number_of_slices")
 
         # ---- ptypy containers, kept for saving and plotting ----
-        self._object = [self.ob.copy(self.ob.ID + "_o_" + str(i)) for i in range(N)]
+        self._object = torch_helpers.slice_containers(self.ob, N)
 
         if len(self.ob.storages) != 1:
             raise NotImplementedError("ThreePIETorch supports a single object storage")
@@ -302,26 +337,50 @@ class ThreePIETorch(stochastic.EPIE, SliceCorruptionMixin, EngineHooks):
                 for _ in range(N)
             ]
         )  # (N, obny, obnx)
+        # .clone() is load-bearing: torch.as_tensor over a contiguous array of
+        # the matching dtype shares its memory, so without it pr_g is a *view*
+        # of the ptypy probe storage. Anything that writes P.probe -- another
+        # engine in the same run, a reload, a plotting helper -- then silently
+        # rewrites this engine's working probe, and _sync_to_ptypy becomes a
+        # self-assignment that hides it. ob_g above is safe because
+        # torch.stack always copies.
         self.pr_g = torch.as_tensor(
             np.ascontiguousarray(self._pr_storage.data), dtype=self.cdt, device=self.dev
-        )  # (M, fny, fnx)
+        ).clone()  # (M, fny, fnx)
+
+        if self.p.init_slices:
+            self._load_init_slices(str(self.p.init_slices))
 
         self._build_propagators()
         self._collect_views()
 
         # ---- optional circular probe support (D8, opt-in) ----
         self.pr_support = None
-        ps = getattr(self.p, "probe_support", None)
-        if bool(self.p.apply_probe_support) and ps is not None and 0 < float(ps) < 1:
-            yy, xx = np.mgrid[: self.fny, : self.fnx]
-            r = np.hypot(yy - self.fny / 2.0, xx - self.fnx / 2.0)
-            mask = (r < float(ps) * min(self.fny, self.fnx) / 2.0).astype(np.float64)
-            self.pr_support = torch.as_tensor(mask, dtype=self.rdt, device=self.dev)
-            logger.info(f"probe support: circular, radius fraction {float(ps):.3f}")
+        if bool(self.p.apply_probe_support):
+            ps = getattr(self.p, "probe_support", None)
+            self.pr_support = torch_helpers.circular_support(
+                ps, (self.fny, self.fnx), self.rdt, self.dev
+            )
+            if self.pr_support is not None:
+                logger.info(f"probe support: circular, radius fraction {float(ps):.3f}")
 
         # sum_m |phi_i|^2 for object_denom='unscattered'; rebuilt whenever the
         # probe moves
         self._phi_cache = None
+
+        # ---- object regularisation ----
+        self._smooth_std = (
+            None if self.p.obj_smooth_std is None else float(self.p.obj_smooth_std)
+        )
+        self._smooth_w = None  # built lazily, once the probe has settled
+        self._clip = None if self.p.clip_object is None else tuple(self.p.clip_object)
+        if self._smooth_std:
+            logger.info(
+                f"object smoothing: std {self._smooth_std:.3g} px, half strength at "
+                f"{float(self.p.obj_smooth_cover):.3g} of the peak coverage"
+            )
+        if self._clip is not None:
+            logger.info(f"object amplitude clipped to {self._clip}")
 
         # ---- reproducibility (D10) ----
         seed = int(self.p.seed)
@@ -331,17 +390,58 @@ class ThreePIETorch(stochastic.EPIE, SliceCorruptionMixin, EngineHooks):
             self._order_gen.manual_seed(seed + 1)
             logger.info(f"seed = {seed}: the position order is reproducible")
 
+        self._err_history = []
         os.makedirs(self.plot_progress_dir, exist_ok=True)
 
         self.post_initialize()
+
+    def _load_init_slices(self, path):
+        """Replace the flat slice start with a stack read from an fslices .h5.
+
+        Reads either naming scheme (the engines' Cobj_o_<j>, the truth dump's
+        obj_<j>), ordered by the trailing slice index, exactly as the plotting
+        and scoring tools read these files.
+        """
+        import re
+
+        import h5py
+
+        N = int(self.p.number_of_slices)
+        with h5py.File(path, "r") as f:
+            objs = f["content/objects"]
+            keys = sorted(
+                objs.keys(), key=lambda k: int(re.search(r"(\d+)$", k).group(1))
+            )
+            slices = []
+            for k in keys:
+                g = objs[k]
+                sk = sorted(g.keys())[0]
+                slices.append(np.asarray(g[sk]["data"])[0])
+        if len(slices) != N:
+            raise ValueError(
+                "init_slices %s holds %d slices, number_of_slices is %d"
+                % (path, len(slices), N)
+            )
+        if slices[0].shape != tuple(self.ob_g.shape[-2:]):
+            raise ValueError(
+                "init_slices canvas %s does not match the object canvas %s"
+                % (slices[0].shape, tuple(self.ob_g.shape[-2:]))
+            )
+        self.ob_g = torch.stack(
+            [
+                torch.as_tensor(
+                    np.ascontiguousarray(s), dtype=self.cdt, device=self.dev
+                )
+                for s in slices
+            ]
+        )
+        logger.info("slice stack initialised from %s" % path)
 
     def _build_propagators(self):
         """Extract the slice-to-slice near-field and the far-field propagators."""
         N = int(self.p.number_of_slices)
         scan = next(iter(self.ptycho.model.scans.values()))
         geom = scan.geometries[0]
-        self._lam = float(np.ravel(geom.lam)[0])
-        self._dxo = float(np.ravel(geom.resolution)[0])
 
         g = Param()
         g.energy = geom.energy
@@ -461,7 +561,7 @@ class ThreePIETorch(stochastic.EPIE, SliceCorruptionMixin, EngineHooks):
 
         # Illuminated region.  Any statistic taken over a slice is meaningless
         # outside it: most of the object array is never touched and stays at
-        # exactly 1.  Read from outside the engine, by the corruption experiments.
+        # exactly 1.  Read from outside the engine, by diagnostics.
         cov = torch.zeros(self.ob_g[0].shape, dtype=self.rdt, device=self.dev)
         for s in range(0, self.n_pos, 256):
             idx = torch.arange(s, min(s + 256, self.n_pos), device=self.dev)
@@ -478,6 +578,62 @@ class ThreePIETorch(stochastic.EPIE, SliceCorruptionMixin, EngineHooks):
         r = self.rows_g[idx]  # (B, fny)
         c = self.cols_g[idx]  # (B, fnx)
         return arr2d[r[:, :, None], c[:, None, :]]
+
+    def _coverage(self):
+        """Accumulated sum_m |P|^2 over every scan position, on the object grid.
+
+        This is the denominator the projectional engines weigh their smoothed
+        inertia term against. Built once: the probe changes during a run, but
+        only its overall scale matters here and the weight is normalised by its
+        own median, so a rebuild would not move the blend.
+        """
+        cov = torch.zeros(self.ob_g.shape[-2:], dtype=self.rdt, device=self.dev)
+        w = (self.pr_g.abs() ** 2).sum(0)  # over probe modes -> (fny, fnx)
+        # _scatter_add materialises B*fny*fnx int64 indices twice, so this walks
+        # in update-sized chunks rather than one pass: at 512x512 frames a batch
+        # of 256 would ask for a gigabyte of indices to build a 6 MB map.
+        step = max(1, int(self.p.batch_size))
+        for s in range(0, self.n_pos, step):
+            idx = torch.arange(
+                s, min(s + step, self.n_pos), device=self.dev, dtype=torch.long
+            )
+            self._scatter_add(cov, idx, w.expand(idx.numel(), -1, -1))
+        return cov
+
+    def _smooth_weight(self):
+        """Per-pixel blend weight for the smoothing regulariser, in [0, 1]."""
+        cov = self._coverage()
+        peak = cov.max()
+        if peak <= 0:  # no illumination anywhere: smooth uniformly
+            return torch.ones_like(cov)
+        c = float(self.p.obj_smooth_cover) * peak
+        w = c / (c + cov)
+        core = cov > 0.5 * peak
+        faint = cov < 0.01 * peak
+        logger.info(
+            "smoothing blend: weight {:.3f} in the illuminated core ({:.1f} % of "
+            "the canvas), {:.3f} out in the faint surround ({:.1f} %)".format(
+                float(w[core].mean()),
+                100.0 * float(core.sum()) / cov.numel(),
+                float(w[faint].mean()) if bool(faint.any()) else float("nan"),
+                100.0 * float(faint.sum()) / cov.numel(),
+            )
+        )
+        return w
+
+    def _regularise_object(self):
+        """Smooth and clip the slices. Called once per iteration, after the sweep.
+
+        Order matters: smooth first, then clip, so the clip is the last word and
+        the object handed to the next iteration honours it exactly.
+        """
+        if self._smooth_std:
+            if self._smooth_w is None:
+                self._smooth_w = self._smooth_weight()
+            blurred = torch_helpers.complex_gaussian_filter(self.ob_g, self._smooth_std)
+            self.ob_g = self.ob_g + self._smooth_w * (blurred - self.ob_g)
+        if self._clip is not None:
+            self.ob_g = torch_helpers.clip_amplitude(self.ob_g, self._clip)
 
     def _scatter_add(self, dst, idx, vals):
         B = idx.numel()
@@ -512,12 +668,16 @@ class ThreePIETorch(stochastic.EPIE, SliceCorruptionMixin, EngineHooks):
             for s in range(0, self.n_pos, B):
                 idx = order[s : s + B]
                 error_dct.update(self._batch_update(idx))
+            self._err_history.append(
+                np.mean(np.stack(list(error_dct.values())), axis=0))
+
+            self._regularise_object()
 
             self.curiter += 1
             if self.curiter % max(1, int(self.p.sync_interval)) == 0:
                 self._sync_to_ptypy()
 
-            if self._plot_int and self.curiter % self._plot_int == 0:
+            if self._plot_int > 0 and self.curiter % self._plot_int == 0:
                 self._plot_progress()
 
         return error_dct
@@ -530,9 +690,11 @@ class ThreePIETorch(stochastic.EPIE, SliceCorruptionMixin, EngineHooks):
         use_max = self._denom == "max"
 
         active = [self.curiter >= self.p.slice_start_iteration[i] for i in range(N)]
-        # D4: probe_update_start gates the psi corrections at *every* slice,
-        # because on CPU the gate lives inside probe_update(), which the
-        # multislice loop calls once per slice.
+        # D4: probe_update_start freezes the probe, i.e. psi_0. It does NOT
+        # reach the psi corrections at the slices above -- see the long note
+        # at the `do_pr or i > 0` in the backward loop for why gating those
+        # too freezes every slice but the last. ThreePIE.psi_update in
+        # threepie.py draws the same line, so the two engines still agree.
         do_pr = self.curiter >= self.p.probe_update_start
 
         if not active[-1] and not self._warned_inactive_last:
@@ -634,7 +796,20 @@ class ThreePIETorch(stochastic.EPIE, SliceCorruptionMixin, EngineHooks):
 
                 # --- illumination update (D2, D5): uses the UPDATED object
                 o_new = ob_p[i] + dob  # (B, ny, nx)
-                if do_pr:
+                #
+                # `do_pr or i > 0`: probe_update_start freezes the PROBE,
+                # which is psi_0 and nothing else. Maiden 2012 applies the same
+                # correction to the wave incident on every slice, and at i > 0
+                # that correction is the only thing that carries the Fourier
+                # residual back up the stack: leave psi_i alone and
+                # bw(psi_i) is exactly exits[i-1] again, so delta at slice
+                # i-1 is identically zero and every slice above the last
+                # freezes with it -- not slowly, but to propagator round-off
+                # (measured: 1.2e-8 after 20 views against 1.07 for the last
+                # slice). More iterations do not help; the gradient is zero,
+                # not small. Gating only at i == 0 still freezes the probe,
+                # because psi_0 is where the probe increment comes from.
+                if do_pr or i > 0:
                     if use_max:
                         on = (M * o_new.abs() ** 2).amax(dim=(-2, -1))[
                             :, None, None, None
@@ -759,4 +934,10 @@ class ThreePIETorch(stochastic.EPIE, SliceCorruptionMixin, EngineHooks):
             self.curiter,
             self.plot_progress_dir,
             psize=getattr(self.p, "psize", (1e-6, 1e-6)),
+            engine_name=type(self).__name__,
+        )
+        torch_helpers.plot_error_history(
+            self._err_history,
+            self.plot_progress_dir,
+            engine_name=type(self).__name__,
         )
