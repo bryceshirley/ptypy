@@ -1,5 +1,5 @@
 """
-ISS multislice engine for ptychography.
+ISS (Inter-Slice Single Scattering) engine for ptychography.
 
 FORWARD MODEL
 -------------
@@ -878,6 +878,10 @@ class ISSTorch(stochastic.EPIE, EngineHooks):
         stores log O, overrides this with the exponential."""
         return self.ob_g
 
+    # Optional {"probe": ..., "phase": ...} colormap override; subclasses
+    # set it to restyle their progress figures without touching the helper.
+    PLOT_CMAPS = None
+
     def _plot_progress(self):
         torch_helpers.plot_progress(
             self.pr_g,
@@ -886,6 +890,11 @@ class ISSTorch(stochastic.EPIE, EngineHooks):
             self.plot_progress_dir,
             psize=getattr(self.p, "psize", (1e-6, 1e-6)),
             engine_name=type(self).__name__,
+            cmaps=self.PLOT_CMAPS,
+            zoom_center=self.p.get("plot_zoom_center", None),
+            phase_clim=self.p.get("plot_phase_clim", None),
+            scalebar=self.p.get("plot_scalebar", None),
+            phase_zero_top=bool(self.p.get("plot_phase_zero_top", False)),
         )
         torch_helpers.plot_error_history(
             self._err_history,

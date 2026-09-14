@@ -205,6 +205,76 @@ class EquivalenceTest(unittest.TestCase):
 
 
 @unittest.skipIf(not HAVE_TORCH, "no torch")
+class ProbeCompensationTest(unittest.TestCase):
+    """A probe update must leave the physical iterate psi untouched.
+
+    W stores only the scattered part; a = ff_fw(P) sits outside it, so a
+    probe change moves both constraint sets. The Sdiag compensation in
+    _probe_update distributes -dP over the branches; if psi moves by more
+    than round-off across the update, that compensation is broken and no
+    solver tuning can help.
+    """
+
+    def test_psi_invariant_under_probe_update(self):
+        P = _make_ptycho("comp")
+        eng = by_name("RAARISSTorch")(
+            P, _torch_pars(numiter=2, number_of_slices=2,
+                           slice_thickness=3e-4, probe_update_start=0,
+                           overlap_max_iterations=1))
+        eng.initialize()
+        eng.prepare()
+        eng._fourier_update()
+
+        def psi():
+            W = eng.W.to(eng.dev)
+            acc = (eng.H_rev[:, 0].unsqueeze(0)
+                   * torch.fft.fft2(W)).sum(dim=1)
+            return eng.pr_g.unsqueeze(0) + torch.fft.ifft2(acc)
+
+        before = psi()
+        eng._probe_update()
+        drift = ((psi() - before).abs().max().item()
+                 / before.abs().max().item())
+        self.assertLess(drift, 1e-12)
+
+
+@unittest.skipIf(not HAVE_TORCH, "no torch")
+class StagingTest(unittest.TestCase):
+    """stage_iterations: the staged phase must be EXACTLY the N = 1
+    problem, and the expansion must hand over cleanly."""
+
+    def test_staged_matches_n1_then_expands(self):
+        P1 = _make_ptycho("stg1")
+        P2 = _make_ptycho("stg2")
+        common = dict(numiter=6, probe_update_start=0,
+                      overlap_max_iterations=10)
+        e1 = by_name("RAARISSTorch")(
+            P1, _torch_pars(number_of_slices=1, **common))
+        e2 = by_name("RAARISSTorch")(
+            P2, _torch_pars(number_of_slices=2, slice_thickness=3e-4,
+                            stage_iterations=3, **common))
+        for eng in (e1, e2):
+            eng.initialize()
+            eng.prepare()
+        for it in range(3):
+            e1.engine_iterate(1)
+            e2.engine_iterate(1)
+            d = (e1.W[:, 0] - e2.W[:, 0]).abs().max().item()
+            scale = e1.W.abs().max().item()
+            self.assertLess(d / scale, 1e-10,
+                            "staged phase diverged from N=1 at iter %d"
+                            % (it + 1))
+        self.assertEqual(e2._Na, 1)
+        err = None
+        for it in range(3):
+            err = e2.engine_iterate(1)
+        self.assertEqual(e2._Na, 2)
+        vals = np.array([v for v in err.values()])
+        self.assertTrue(np.isfinite(vals).all())
+        self.assertEqual(int(e2.ob_g.shape[0]), 2)
+
+
+@unittest.skipIf(not HAVE_TORCH, "no torch")
 class SmokeN2Test(unittest.TestCase):
     """The engine runs at N = 2 and the Fourier error falls."""
 
