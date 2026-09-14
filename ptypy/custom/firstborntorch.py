@@ -590,7 +590,10 @@ class FirstBornTorch(stochastic.EPIE, EngineHooks):
         # Here, not in __init__: a caller may point plot_progress_dir somewhere
         # else between construction and the run, and making the default at
         # construction time left an empty timestamped directory behind.
-        os.makedirs(self.plot_progress_dir, exist_ok=True)
+        # Only when plotting is on: with plot_interval = 0 nothing is ever
+        # written there and the empty timestamped directory is pure litter.
+        if self._plot_int > 0:
+            os.makedirs(self.plot_progress_dir, exist_ok=True)
         self.post_initialize()
 
     def _build_farfield(self):
