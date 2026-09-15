@@ -251,6 +251,76 @@ class ProbeCompensationTest(unittest.TestCase):
 
 
 @unittest.skipIf(not HAVE_TORCH, "no torch")
+class PositionRefinementTest(unittest.TestCase):
+    """Corrupted gather positions must move back toward the truth.
+
+    Needs overlap redundancy (dense scan) and a converged object+probe:
+    at sparse overlap or from a flat start the object simply heals
+    around the misplaced views and the position signal vanishes."""
+
+    def test_shifts_recover(self):
+        p = u.Param()
+        p.frames_per_block = 100000
+        p.verbose_level = "warning"
+        p.data_type = "double"
+        p.io = u.Param(home="/tmp/raar_test_posref",
+                       interaction=u.Param(active=False),
+                       autosave=u.Param(active=False),
+                       autoplot=u.Param(active=False))
+        p.scans = u.Param()
+        p.scans.MF = u.Param(name="Full", propagation="farfield")
+        p.scans.MF.data = u.Param(name="MoonFlowerScan", num_frames=60,
+                                  shape=64, save=None, photons=1e8,
+                                  psf=0.0, density=0.1,
+                                  add_poisson_noise=False)
+        p.scans.MF.coherence = u.Param(num_probe_modes=1)
+        P = Ptycho(p, level=4)
+        P.runtime.iter_info = []
+
+        psize = float(np.max(list(P.obj.storages.values())[0].psize))
+        posref = u.Param(method="Annealing", metric="fourier",
+                         start=12, stop=100, interval=1, nshifts=8,
+                         amplitude=2.5 * psize, max_shift=5 * psize,
+                         amplitude_decay=False, record=False)
+        eng = by_name("RAARISSTorch")(
+            P, _torch_pars(numiter=24, beta=0.9,
+                           probe_update_start=0,
+                           overlap_max_iterations=10,
+                           position_refinement=posref))
+        eng.initialize()
+        eng.prepare()
+        self.assertTrue(eng.do_position_refinement)
+        for _ in range(12):
+            eng.engine_iterate(1)
+
+        true_r = eng.rows[:, 0].clone()
+        true_c = eng.cols[:, 0].clone()
+        gen = np.random.default_rng(0)
+        pick = set(gen.choice(eng.n_pos, size=eng.n_pos // 3,
+                              replace=False).tolist())
+        for i in pick:
+            dy, dx = gen.integers(-2, 3, size=2)
+            eng.rows[i] += int(dy)
+            eng.cols[i] += int(dx)
+
+        def wrong():
+            w = (eng.rows[:, 0] != true_r) | (eng.cols[:, 0] != true_c)
+            return set(torch.nonzero(w).ravel().tolist())
+
+        before = len(wrong())
+        self.assertGreater(before, 0)
+        for _ in range(12):
+            eng.engine_iterate(1)
+        bad = wrong()
+        drift = len(bad - pick)
+        self.assertLess(len(bad), 0.75 * before,
+                        "positions did not move back to the truth "
+                        "(%d wrong before, %d after)" % (before, len(bad)))
+        self.assertLessEqual(drift, 3,
+                             "%d correct views drifted away" % drift)
+
+
+@unittest.skipIf(not HAVE_TORCH, "no torch")
 class SmokeN2Test(unittest.TestCase):
     """The engine runs at N = 2 and the Fourier error falls."""
 

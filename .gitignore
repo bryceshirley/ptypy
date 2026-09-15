@@ -33,3 +33,5 @@ data/
 data_butterfly/
 result/
 iteration_progress*/
+.claude/
+ISS-work/

@@ -302,6 +302,18 @@ class _ProjectionEngineISS(ISSEngineInfra, projectional._ProjectionEngine):
     help = Where the branch waves live; 'same' keeps them on p.device, 'cpu'
       keeps them host-side and streams chunks
 
+    [posref_min_gain]
+    default = 0.001
+    type = float
+    help = Relative error decrease a trial position must achieve to be
+      accepted by position refinement
+    doc = The bare "any improvement" acceptance of Annealing lets model
+      noise (sub-0.1% error differences between neighbouring shifts)
+      random-walk positions that are already correct, degrading the
+      reconstruction on data with good encoder positions. A genuine
+      position error changes the misfit by tens of percent, so a small
+      margin costs no sensitivity.
+
     [probe_denom]
     default = slices
     type = str
@@ -371,6 +383,11 @@ class _ProjectionEngineISS(ISSEngineInfra, projectional._ProjectionEngine):
         # zero start makes the first probe round report change = 1,
         # as in projectional
         self._pr_buf = torch.zeros_like(self.pr_g)
+
+        # accumulated integer-pixel position corrections, (n_pos, 2) as
+        # (dy, dx); position_update moves rows/cols and records here
+        self._pos_shift = torch.zeros((self.n_pos, 2), dtype=torch.long,
+                                      device=self.dev)
 
         gib = self.Psi.numel() * self.Psi.element_size() / 2**30
         logger.info("branch waves: %s on %s (%.2f GiB)"
@@ -653,11 +670,126 @@ class _ProjectionEngineISS(ISSEngineInfra, projectional._ProjectionEngine):
         self._drop_probe_caches()
         return change
 
+    def _pos_err(self, idx, dy, dx):
+        """Fourier misfit of the overlap image for a chunk with its
+        positions shifted by (dy, dx) pixels: the metric ptypy's
+        Annealing refinement uses, evaluated on the ISS model
+        :math:`|\\mathcal{F}[P + \\mathcal{A}\\,\\Pi_O(\\Psi)]|`.
+
+        Returns the per-view mean-square amplitude error, (B,) real."""
+        B = idx.numel()
+        rows = self.rows[idx] + dy[:, None]
+        cols = self.cols[idx] + dx[:, None]
+        flat = (rows[:, :, None] * self.onx + cols[:, None, :]).reshape(-1)
+        O = torch.stack([self._gather(self.ob_g[j], flat, B)
+                         for j in range(self.ob_g.shape[0])])
+        dO = (self._model_object(O) - 1.0).transpose(0, 1).unsqueeze(2)
+        psihat = branch_fw(dO * self._Pj.unsqueeze(0), self._P_hat,
+                           self.H_rev, self._ff_fw, base_torch.apply_torch)
+        af2 = psihat.abs().square().sum(dim=1)
+        if getattr(self, "_posref_metric", "fourier") == "photon":
+            I_dat = self.amp_dat[idx].square()
+            resid = (af2 - I_dat).square() / (I_dat + 1.0)
+        else:
+            resid = (af2.clamp_min(0).sqrt() - self.amp_dat[idx]).square()
+        if self.maskb is not None:
+            m = self.maskb[idx].to(self.rdt)
+            return (m * resid).sum(dim=(-2, -1)) \
+                / m.sum(dim=(-2, -1)).clamp_min(1.0)
+        return resid.mean(dim=(-2, -1))
+
+    def position_update(self):
+        """Torch-native position refinement (annealed random search).
+
+        PositionCorrectionEngine supplies the parameter tree, the object
+        padding and the annealing schedule; trial integer-pixel shifts
+        are scored per view with :meth:`_pos_err` and accepted moves are
+        applied to this engine's gather indices directly. The refined
+        coordinates reach the ptypy views at finalize when
+        position_refinement.record is on."""
+        if not self.do_position_refinement:
+            return
+        pr = self.p.position_refinement
+        if not (pr.stop > self.curiter >= pr.start):
+            return
+        if (self.curiter % max(1, int(pr.interval))) != 0:
+            return
+        self.position_refinement.update_constraints(self.curiter)
+        self._posref_gain = float(self.p.get("posref_min_gain", 1e-3))
+        self._posref_metric = str(pr.get("metric", "fourier"))
+        psize = float(np.max(self._obs.psize))
+        # posref.py's "if you cannot move far, do nothing": once the
+        # annealed amplitude decays below one pixel the search is over --
+        # without this it walks +-1 px until the last iteration
+        if self.position_refinement.max_shift_dist <= psize:
+            return
+        amp = int(round(self.position_refinement.max_shift_dist / psize))
+        cap = max(1, int(round(float(pr.max_shift) / psize)))
+        gen = self._order_gen
+        moved = 0
+        for s in range(0, self.n_pos, self.chunk):
+            idx = torch.arange(s, min(s + self.chunk, self.n_pos),
+                               device=self.dev)
+            B = idx.numel()
+            zero = torch.zeros(B, dtype=torch.long, device=self.dev)
+            best_err = self._pos_err(idx, zero, zero)
+            best_dy, best_dx = zero.clone(), zero.clone()
+            for t in range(int(pr.nshifts)):
+                # posref.py's quadrant cycling: one trial per Cartesian
+                # quadrant, magnitudes never below one pixel
+                sy = 1 if t % 2 == 0 else -1
+                sx = 1 if (t // 2) % 2 == 0 else -1
+                dy = sy * torch.randint(1, amp + 1, (B,), generator=gen,
+                                        device=self.dev)
+                dx = sx * torch.randint(1, amp + 1, (B,), generator=gen,
+                                        device=self.dev)
+                # total shift capped at max_shift, patch kept on canvas
+                dy = (self._pos_shift[idx, 0] + dy).clamp(-cap, cap) \
+                    - self._pos_shift[idx, 0]
+                dx = (self._pos_shift[idx, 1] + dx).clamp(-cap, cap) \
+                    - self._pos_shift[idx, 1]
+                r0 = self.rows[idx, 0] + dy
+                c0 = self.cols[idx, 0] + dx
+                ok = ((r0 >= 0) & (r0 + self.fny <= self.ony)
+                      & (c0 >= 0) & (c0 + self.fnx <= self.onx))
+                dy = torch.where(ok, dy, zero)
+                dx = torch.where(ok, dx, zero)
+                err = self._pos_err(idx, dy, dx)
+                better = err < best_err * (1.0 - self._posref_gain)
+                best_err = torch.where(better, err, best_err)
+                best_dy = torch.where(better, dy, best_dy)
+                best_dx = torch.where(better, dx, best_dx)
+            hit = (best_dy != 0) | (best_dx != 0)
+            if bool(hit.any()):
+                self.rows[idx] += best_dy[:, None]
+                self.cols[idx] += best_dx[:, None]
+                self._pos_shift[idx, 0] += best_dy
+                self._pos_shift[idx, 1] += best_dx
+                moved += int(hit.sum())
+        if moved:
+            # denominator and fused numerator were scattered at the old
+            # positions
+            self._den_cache = None
+            self._acc_valid = False
+            logger.info("position refinement: moved %d of %d views, "
+                        "max |shift| %d px"
+                        % (moved, self.n_pos,
+                           int(self._pos_shift.abs().max())))
+
     def engine_finalize(self):
         """Write the slices, then sync refined positions; skips
         _ProjectionEngine's cleanup of containers never allocated here."""
         del self.Psi
         self._write_slices()
+        if getattr(self, "do_position_refinement", False) \
+                and bool(self.p.position_refinement.record):
+            psize = np.asarray(self._obs.psize).ravel()
+            for i, n in enumerate(self.view_names):
+                dy, dx = self._pos_shift[i].tolist()
+                if dy or dx:
+                    v = self.di.views[n].pod.ob_view
+                    v.coord = v.coord + np.array([dy * psize[0],
+                                                  dx * psize[-1]])
         return PositionCorrectionEngine.engine_finalize(self)
 
 
