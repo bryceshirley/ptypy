@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-ISS vs multislice diagnostics, as a ptypy engine.
+ISS (Inter-Slice Single Scattering) vs multislice diagnostics, as a ptypy engine.
 
 WHAT THIS IS
 ------------
@@ -87,6 +87,7 @@ import numpy as np
 from matplotlib import pyplot as plt
 from matplotlib.colors import LogNorm
 
+from ptypy.custom.torch.base_torch import TorchMixin
 from ptypy.engines import stochastic
 from ptypy.engines import register
 from ptypy.utils import Param
@@ -115,55 +116,6 @@ def _scalar(x):
     float() on a 1-element array is deprecated / on a 2-element one is an
     error, so everything numeric from geom goes through here."""
     return float(np.ravel(np.asarray(x))[0])
-
-
-def _op_call(op, arr):
-    last = None
-    for dt in (np.complex64, np.complex128):
-        try:
-            return np.asarray(op(arr.astype(dt)), dtype=np.complex128)
-        except Exception as e:      # noqa: BLE001
-            last = e
-    raise RuntimeError("could not call propagator: %s" % last)
-
-
-def _apply_numpy(kind, d, w):
-    if kind == 'lsi':
-        return np.fft.ifft2(np.fft.fft2(w) * d['H'])
-    if kind == 'ilsi':
-        return np.fft.fft2(np.fft.ifft2(w) * d['H'])
-    if kind == 'chirp':
-        return d['A'] * np.fft.fft2(d['R'] * w)
-    return d['A'] * np.fft.ifft2(d['R'] * w)
-
-
-def _extract_operator(op, shape, name, rtol=1e-5):
-    ny, nx = shape
-    d00 = np.zeros(shape, dtype=np.complex128)
-    d00[0, 0] = 1.0
-    out00 = _op_call(op, d00)
-    out1 = _op_call(op, np.ones(shape, dtype=np.complex128))
-
-    cands = [('lsi', {'H': np.fft.fft2(out00)}),
-             ('ilsi', {'H': float(ny * nx) * np.fft.ifft2(out00)})]
-    if np.abs(out00).min() > 0:
-        cands += [('chirp', {'A': out00, 'R': np.fft.ifft2(out1 / out00)}),
-                  ('ichirp', {'A': out00, 'R': np.fft.fft2(out1 / out00)})]
-
-    rng = np.random.default_rng(0)
-    w = (rng.standard_normal(shape) + 1j * rng.standard_normal(shape)).astype(np.complex128)
-    ref = _op_call(op, w)
-    scale = max(np.abs(ref).max(), 1e-30)
-
-    errs = {k: np.abs(_apply_numpy(k, d, w) - ref).max() / scale for k, d in cands}
-    kind = min(errs, key=errs.get)
-    if errs[kind] > rtol:
-        raise RuntimeError("%s: propagator extraction failed, errors %s"
-                           % (name, {k: '%.2e' % v for k, v in errs.items()}))
-    spec = {'kind': kind}
-    spec.update(dict(cands)[kind])
-    logger.info("%s extracted as '%s' (error %.2e)" % (name, kind, errs[kind]))
-    return spec
 
 
 # ===========================================================================
@@ -195,66 +147,6 @@ def _slice_candidates(ground_truth, fslices=None):
     return sorted(set(hits))
 
 
-def _pick_slices(cands, want_iter=None, verbose=False):
-    """First guess: the file at the .ptyr's iteration, else the highest.
-
-    A results folder accumulates one fslices file per run, so listing them all
-    is noise when the first guess is right; they are only listed if the guess
-    has to be second-guessed against the data.
-    """
-    if not cands:
-        return None
-    if verbose and len(cands) > 1:
-        logger.info("%d candidate slice files:" % len(cands))
-        for h in cands:
-            logger.info("    iter %5d   %s" % (_slice_iter(h), os.path.basename(h)))
-    if want_iter is not None:
-        exact = [h for h in cands if _slice_iter(h) == want_iter]
-        if exact:
-            return exact[0]
-    return sorted(cands, key=_slice_iter)[-1]
-
-
-def _find_slices(ground_truth, fslices=None, want_iter=None):
-    """Locate the engine's fslices output inside a results folder.
-
-    p.engines.engineXX.fslices embeds the engine's numiter, and p.io.rfile
-    embeds the actual iteration count, so a folder that has seen several runs
-    holds several of each. Preferring the newest by modification time pairs
-    files from different runs, which is exactly the failure this guards
-    against: the slice file whose iteration matches the chosen .ptyr wins, and
-    the highest iteration otherwise.
-    """
-    if fslices and os.path.isfile(fslices):
-        return fslices
-    if ground_truth and os.path.isfile(ground_truth):
-        return ground_truth
-    if not ground_truth:
-        return None
-    hits = []
-    for p in ('*slices-*.h5', '*slices*.h5', 'slices.h5'):
-        hits += glob.glob(os.path.join(ground_truth, p))
-        if hits:
-            break
-    hits = sorted(set(hits))
-    if not hits:
-        hits = sorted(glob.glob(os.path.join(ground_truth, '*.h5')))
-    if not hits:
-        return None
-    if len(hits) > 1:
-        logger.info("%d candidate slice files:" % len(hits))
-        for h in hits:
-            logger.info("    iter %5d   %s" % (_slice_iter(h), os.path.basename(h)))
-    if want_iter is not None:
-        exact = [h for h in hits if _slice_iter(h) == want_iter]
-        if exact:
-            return exact[0]
-        logger.warning("no slice file at iteration %d; the .ptyr and the "
-                       "slices may come from different runs" % want_iter)
-    hits.sort(key=_slice_iter)
-    return hits[-1]
-
-
 def _iter_of(path):
     stem = os.path.splitext(os.path.basename(path))[0]
     tail = stem.rsplit('_', 1)[-1]
@@ -265,27 +157,6 @@ def _engine_of(path):
     stem = os.path.splitext(os.path.basename(path))[0]
     parts = stem.rsplit('_', 2)
     return parts[-2] if len(parts) >= 2 else ''
-
-
-def _find_ptyr(ground_truth, ptyr=None, engine=None):
-    """Newest .ptyr by iteration count, optionally restricted to one engine.
-
-    p.io.rfile interpolates %(engine)s and %(iterations)04d, so a folder that
-    has seen several engines holds several files; the one that matters is the
-    one that wrote the slices.
-    """
-    if ptyr and os.path.isfile(ptyr):
-        return ptyr
-    if not ground_truth or os.path.isfile(ground_truth):
-        return None
-    hits = glob.glob(os.path.join(ground_truth, '*.ptyr'))
-    if engine:
-        sel = [h for h in hits if str(engine).lower() in _engine_of(h).lower()]
-        hits = sel or hits
-    if not hits:
-        return None
-    hits.sort(key=_iter_of)
-    return hits[-1]
 
 
 def _read_slices(fpath):
@@ -331,7 +202,7 @@ def _read_ptyr(fpath):
 # ===========================================================================
 
 @register()
-class ISSDiagnostics(stochastic.EPIE):
+class ISSDiagnostics(TorchMixin, stochastic.EPIE):
     """
     Read-only engine: compare the ISS and multislice forward models on a
     finished reconstruction, write the numbers and the figures, and stop.
@@ -558,14 +429,7 @@ class ISSDiagnostics(stochastic.EPIE):
         N = int(self.p.number_of_slices)
         self.N = N
 
-        dev = str(self.p.device)
-        if dev.startswith('cuda') and not torch.cuda.is_available():
-            logger.warning("CUDA unavailable, falling back to CPU")
-            dev = 'cpu'
-        self.dev = torch.device(dev)
-        dbl = str(self.p.precision).lower().startswith('d')
-        self.cdt = torch.complex128 if dbl else torch.complex64
-        self.rdt = torch.float64 if dbl else torch.float32
+        self._setup_torch_device()
 
         if len(self.ob.storages) != 1 or len(self.pr.storages) != 1:
             raise NotImplementedError("single object and probe storage only")
@@ -712,18 +576,6 @@ class ISSDiagnostics(stochastic.EPIE):
                         "is what establishes that. Worth checking "
                         "engine_finalize if you rely on the .ptyr object."
                         % detail)
-
-    def _build_farfield(self):
-        pod = next(list(v.pods.values())[0]
-                   for v in self.di.views.values() if v.active)
-        shape = (self.fny, self.fnx)
-        for tag, spec in (('fw', _extract_operator(pod.fw, shape, "farfield fw")),
-                          ('bw', _extract_operator(pod.bw, shape, "farfield bw"))):
-            g = {'kind': spec['kind']}
-            for k in ('H', 'A', 'R'):
-                if k in spec:
-                    g[k] = torch.as_tensor(spec[k], dtype=self.cdt, device=self.dev)
-            setattr(self, '_ff_' + tag, g)
 
     def _collect_views(self):
         """The view set stochastic.EPIE walks, with data and masks."""

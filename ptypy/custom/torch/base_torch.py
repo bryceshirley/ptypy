@@ -35,6 +35,7 @@ except ImportError:  # pragma: no cover
     torch = None
 
 import os
+import sys
 
 from matplotlib import pyplot as plt
 from matplotlib.patches import Rectangle
@@ -259,21 +260,6 @@ def apply_torch(spec, w):
     raise ValueError(k)
 
 
-def _remove_ramp(ph):
-    """Subtract the best-fit second-order surface: the probe-tilt/object-
-    ramp gauge (linear) and the probe-defocus/object-curvature gauge
-    (quadratic). Display only; the stored object is untouched."""
-    ny, nx = ph.shape
-    yy, xx = np.mgrid[0:ny, 0:nx]
-    x = (xx / nx - 0.5).ravel()
-    y = (yy / ny - 0.5).ravel()
-    A = np.stack([x, y, x * x, y * y, x * y, np.ones(ph.size)], axis=1)
-    # coarse subsample keeps the fit cheap on big canvases
-    sel = slice(None, None, max(1, ph.size // 200000))
-    coef, *_ = np.linalg.lstsq(A[sel], ph.ravel()[sel], rcond=None)
-    return ph - (A @ coef).reshape(ny, nx)
-
-
 def _draw_scalebar(ax, extent, length_um):
     """Red scale bar with label, lower right of the panel."""
     x0, x1, y0, y1 = extent[0], extent[1], extent[2], extent[3]
@@ -349,15 +335,15 @@ def plot_progress(pr_g, ob_g, curiter, outdir, psize=(1e-6, 1e-6), crop=512,
     # Offset removal: the unwrapped phase sits at an arbitrary level; the
     # median is the empty background wherever most of the field is empty,
     # with no dataset-specific reference window to maintain.
-    # Unwrap + gauge removal gives the cleanest display for smooth phases,
-    # but on strongly wrapped objects (a zone plate after gauge drift) the
+    # Unwrapping gives the cleanest display for smooth phases, but on
+    # strongly wrapped objects (a zone plate after gauge drift) the
     # unwrapper assigns 2-pi branches per island and the panel turns into
     # patchwork. Fall back to the raw wrapped phase when that happens.
     slice_ph = []
     slice_flip = []
     for j in range(n_slices):
         wrapped = ob_g[j].angle().cpu().numpy()[win]
-        ph = _remove_ramp(unwrap_phase(wrapped))
+        ph = unwrap_phase(wrapped)
         ph -= np.median(ph)
         span = np.percentile(ph, 99.5) - np.percentile(ph, 0.5)
         if span > 6 * np.pi:
@@ -697,24 +683,168 @@ from ptypy import io
 from ptypy import utils as u
 from ptypy.utils import Param
 
+class _TermRecorder:
+    """Capped, order-preserving buffer shared by the stdout/stderr tees."""
+
+    def __init__(self, cap=16 << 20):
+        self.parts, self.n, self.cap = [], 0, cap
+
+    def add(self, x):
+        if self.n < self.cap:
+            self.parts.append(x)
+            self.n += len(x)
+
+    def dump(self):
+        return "".join(self.parts)
+
+
+class _TeeStream:
+    """Mirror writes to the live stream and the engine's terminal log.
+
+    Until the log path is known (the engine does not exist yet during
+    Ptycho init levels 1-3) the stream runs in RECORDER mode: writes pass
+    through and accumulate in a shared capped buffer. When the engine
+    resolves its log file, _start_terminal_log dumps that recording into
+    the file and attaches the handle, so the terminal log carries the FULL
+    run output -- data import, POD creation, probe/object init -- not just
+    what follows engine_initialize.
+    """
+
+    _torch_tee = True
+
+    def __init__(self, stream, fh=None, rec=None):
+        self._s, self._f, self._rec = stream, fh, rec
+
+    def attach(self, fh):
+        self._f, self._rec = fh, None
+
+    def write(self, x):
+        self._s.write(x)
+        if self._f is not None:
+            self._f.write(x)
+            self._f.flush()
+        elif self._rec is not None:
+            self._rec.add(x)
+
+    def flush(self):
+        self._s.flush()
+        if self._f is not None:
+            self._f.flush()
+
+    def __getattr__(self, a):
+        return getattr(self._s, a)
+
+
+def _repoint_log_handlers():
+    """Point ptypy's stream handlers at the current (wrapped) stderr."""
+    import logging
+    for lg in (logging.getLogger(), logging.getLogger("ptypy")):
+        for h in lg.handlers:
+            if isinstance(h, logging.StreamHandler) \
+                    and not isinstance(h, logging.FileHandler):
+                h.stream = sys.stderr
+
+
+def _install_terminal_recorder():
+    """Pass-through recorders on stdout/stderr, installed at import time.
+
+    Run scripts import the engine modules before Ptycho is built, so the
+    recording starts ahead of init level 1 and the engine's terminal log
+    can include everything the run printed. Pure pass-through until an
+    engine attaches a file; the cap stops the buffer growing without bound
+    in a process that never does. A tee installed by a run script (the
+    legacy _Tee pattern) is respected and nothing is wrapped over it.
+    """
+    cur = type(sys.stdout)
+    if getattr(cur, "_torch_tee", False) or cur.__name__ == "_Tee":
+        return
+    rec = _TermRecorder()
+    sys.stdout = _TeeStream(sys.stdout, rec=rec)
+    sys.stderr = _TeeStream(sys.stderr, rec=rec)
+    _repoint_log_handlers()
+
+
+_install_terminal_recorder()
+
+
 # ===========================================================================
 #  Shared torch infrastructure
 # ===========================================================================
-class TorchEngineInfra:
-    """Torch infrastructure shared by the ISS engines, gradient and
-    projection alike: device/dtype setup, object/probe tensors with warm
-    starts, propagator kernels, far-field extraction, view collection and
-    gather/scatter, the progress plotting, and the slice write-out.
+class TorchMixin:
+    """Model-agnostic torch plumbing shared by the custom engines:
+    device/dtype setup, far-field operator extraction, the BaseEngine
+    probe-support convention, and the progress plotting and terminal
+    logging, together with the Defaults for the shared plotting and
+    logging options below. Family infrastructure (ISSEngineInfra) or
+    an engine mixes this in; everything model-specific stays in the
+    concrete engine's own parameter tree.
 
-    Deliberately carries NO Defaults block and no engine base class: each
-    concrete engine brings its own parameter tree (stochastic for the
-    gradient engines, projectional for RAAR) and mixes this in for the
-    plumbing only.
+    Defaults:
+
+    [plot_interval]
+    default = 0
+    type = int
+    help = Iterations between diagnostic PNGs, 0 disables
+
+    [plot_dir]
+    default = None
+    type = str
+    help = Directory for the progress figures and terminal log; None
+      auto-creates a timestamped iteration_progress_<engine>_<stamp>/ in
+      the CURRENT WORKING directory (not the run's output directory)
+
+    [plot_error_channels]
+    default = fourier,photon,exit
+    type = str
+    help = Which error channels the convergence PNG draws
+    doc = Comma-separated subset of fourier, photon, exit. The error
+          HISTORY always records all three; this only selects what
+          error_history.png shows.
+
+    [plot_zoom_center]
+    default = None
+    type = tuple
+    help = Fractional (x, y) centre of the object zoom box in the progress
+      figures, origin lower-left; None means the panel centre
+
+    [plot_phase_zero_top]
+    default = True
+    type = bool
+    help = Shift each slice's displayed phase so the background sits at 0 and
+      the colour bar tops out there (phase purely negative, the x-ray paper
+      figure convention)
+
+    [plot_phase_clim]
+    default = None
+    type = tuple
+    help = Explicit (vmin, vmax) for the phase panels; None uses robust
+      percentiles
+
+    [plot_scalebar]
+    default = None
+    type = tuple
+    help = Red scale bars (full_um, zoom_um) on the object panels, e.g.
+      (2.0, 0.5); None draws none
+
+    [terminal_log]
+    default = auto
+    type = str
+    help = Mirror this process's stdout/stderr into a log file
+    doc = 'auto' writes terminal.log inside the progress directory when
+          plotting is on, else <fslices stem>_terminal.log; an explicit
+          path is used as given; '' disables. A tee already installed by
+          the run script is detected and left alone.
     """
 
-    PLOT_CMAPS = None
+    # {"probe": ..., "phase": ...} colormaps for the progress figures;
+    # subclasses may override to restyle without touching the helper.
+    PLOT_CMAPS = {"probe": "inferno", "phase": "Greys_r"}
 
     def _stamp_plot_dir(self):
+        explicit = self.p.get("plot_dir", None)
+        if explicit:
+            self.plot_progress_dir = str(explicit)
+            return
         # Local time on purpose: this names a run directory the user reads.
         # The class name is in it so a folder of runs identifies its solver
         # without the log (type(self) so subclasses label themselves).
@@ -722,11 +852,10 @@ class TorchEngineInfra:
         self.plot_progress_dir = \
             f"iteration_progress_{type(self).__name__}_{stamp}"
 
-    def _setup_torch_infra(self):
+    def _setup_torch_device(self):
+        """Resolve device and dtypes from p.device / p.precision."""
         if torch is None:
             raise ImportError("ISSTorch requires PyTorch")
-
-        N = self.p.number_of_slices
         want = str(self.p.device)
         if want.startswith("cuda") and not torch.cuda.is_available():
             logger.warning("CUDA unavailable, falling back to CPU")
@@ -736,6 +865,175 @@ class TorchEngineInfra:
         self.cdt = torch.complex128 if dbl else torch.complex64
         self.rdt = torch.float64 if dbl else torch.float32
 
+    def _setup_probe_support(self):
+        """Circular probe support whenever p.probe_support is set."""
+        # BaseEngine's [probe_support] convention: a circular support is
+        # applied whenever the fraction is set (None disables, the
+        # PositionCorrectionEngine default)
+        self.pr_support = circular_support(
+            getattr(self.p, "probe_support", None),
+            (self.fny, self.fnx),
+            self.rdt,
+            self.dev,
+        )
+        if self.pr_support is not None:
+            logger.info(
+                f"probe support: circular, radius fraction "
+                f"{float(self.p.probe_support):.3f}"
+            )
+
+    def _setup_plot_state(self):
+        """Error history, plot cadence, progress dir, terminal log, and
+        the reproducibility record (run script copy, git commit)."""
+        self._err_history = []
+        self._plot_int = max(0, int(self.p.plot_interval))
+        # Only when plotting is on: with plot_interval = 0 nothing is ever
+        # written there and the empty timestamped directory is pure litter.
+        if self._plot_int > 0:
+            os.makedirs(self.plot_progress_dir, exist_ok=True)
+            self._save_run_script()
+        self._start_terminal_log()
+        self._log_git_commit()
+
+    def _save_run_script(self):
+        """Copy the entry script into the progress directory, so a run
+        folder records exactly what produced it."""
+        import shutil
+        src = os.path.abspath(sys.argv[0]) if sys.argv and sys.argv[0] else ""
+        if not src.endswith(".py") or not os.path.isfile(src):
+            return
+        try:
+            shutil.copy2(src, os.path.join(
+                self.plot_progress_dir,
+                "run_script_" + os.path.basename(src)))
+            logger.info("run script saved: %s" % os.path.basename(src))
+        except OSError as e:
+            logger.warning("could not save the run script: %s" % e)
+
+    def _log_git_commit(self):
+        """Record the ptypy git commit (and dirty state) in the run log."""
+        import subprocess
+        here = os.path.dirname(os.path.abspath(__file__))
+        try:
+            head = subprocess.run(
+                ["git", "-C", here, "rev-parse", "--short=12", "HEAD"],
+                capture_output=True, text=True, timeout=5)
+            if head.returncode != 0:
+                return
+            # -uno: the tracked files decide dirtiness, untracked scans of
+            # a large data tree would stall the engine start
+            dirty = subprocess.run(
+                ["git", "-C", here, "status", "--porcelain", "-uno"],
+                capture_output=True, text=True, timeout=5)
+            flag = " (dirty)" if dirty.stdout.strip() else ""
+            logger.info("ptypy git commit: %s%s"
+                        % (head.stdout.strip(), flag))
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+    def _start_terminal_log(self):
+        """Attach the run's log file to the import-time terminal recorder.
+
+        Engine-owned so every run is logged without each script rebuilding
+        the tee, and COMPLETE: the recorder has been buffering since the
+        engine module was imported, so the file starts with the full
+        Ptycho init output (data import, POD creation, probe/object init),
+        exactly what the legacy script-side _Tee captured. p.terminal_log
+        gives the path; 'auto' resolves into the progress directory when
+        plotting is on, else next to fslices; '' disables. Idempotent: a
+        script's own tee, or a previous engine's attached log in this
+        process, is detected and left alone.
+        """
+        spec = str(self.p.get("terminal_log", "auto") or "")
+        if not spec:
+            return
+        cur = sys.stdout
+        if isinstance(cur, _TeeStream):
+            if cur._f is not None:
+                return          # an earlier engine already logs this process
+        elif getattr(type(cur), "_torch_tee", False) \
+                or type(cur).__name__ == "_Tee":
+            return              # the run script installed its own tee
+        if spec.lower() == "auto":
+            if self._plot_int > 0:
+                path = os.path.join(self.plot_progress_dir, "terminal.log")
+            else:
+                path = os.path.splitext(str(self.p.fslices))[0] \
+                    + "_terminal.log"
+        else:
+            path = spec
+        d = os.path.dirname(path)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        fh = open(path, "a")  # noqa: SIM115 - lives for the process
+        if isinstance(cur, _TeeStream):
+            if cur._rec is not None:
+                fh.write(cur._rec.dump())
+                fh.flush()
+            cur.attach(fh)
+            if isinstance(sys.stderr, _TeeStream):
+                sys.stderr.attach(fh)
+        else:
+            # recorder was never installed (module imported some unusual
+            # way): fall back to teeing from here on
+            sys.stdout = _TeeStream(sys.stdout, fh=fh)
+            sys.stderr = _TeeStream(sys.stderr, fh=fh)
+        _repoint_log_handlers()
+        logger.info("terminal log: %s" % path)
+
+    def _build_farfield(self):
+        """Extracts fw (forward) and bw (backward) far-field propagators from ptypy."""
+        pod = next(iter(next(iter(self.di.views.values())).pods.values()))
+        shape = (self.fny, self.fnx)
+        for tag, op in (("fw", pod.fw), ("bw", pod.bw)):
+            spec = extract_operator(op, shape, f"farfield {tag}")
+            setattr(
+                self, f"_ff_{tag}", to_torch(spec, self.cdt, self.dev)
+            )
+
+    @staticmethod
+    def _apply(spec, w):
+        return apply_torch(spec, w)
+
+    def _display_object(self):
+        """Slice transmissions for plotting; the tangent subclass, which
+        stores log O, overrides this with the exponential."""
+        return self.ob_g
+
+    def _plot_progress(self):
+        plot_progress(
+            self.pr_g,
+            self._display_object(),
+            self.curiter,
+            self.plot_progress_dir,
+            psize=getattr(self.p, "psize", (1e-6, 1e-6)),
+            engine_name=type(self).__name__,
+            cmaps=self.PLOT_CMAPS,
+            zoom_center=self.p.get("plot_zoom_center", None),
+            phase_clim=self.p.get("plot_phase_clim", None),
+            scalebar=self.p.get("plot_scalebar", None),
+            phase_zero_top=bool(self.p.get("plot_phase_zero_top", False)),
+        )
+        plot_error_history(
+            self._err_history,
+            self.plot_progress_dir,
+            engine_name=type(self).__name__,
+            channels=self.p.get("plot_error_channels", None),
+        )
+
+
+
+class ISSEngineInfra(TorchMixin):
+    """ISS-family infrastructure on TorchMixin: object/probe tensors
+    with warm starts, the cumulative branch propagators, view
+    collection with flat-index gather/scatter, and the slice
+    write-out. The ISS engines mix this in for the plumbing only.
+    """
+
+    def _setup_torch_infra(self):
+        self._setup_torch_device()
+
+        N = self.p.number_of_slices
         self._obs = next(iter(self.ob.storages.values()))
         self._prs = next(iter(self.pr.storages.values()))
         self.M, self.fny, self.fnx = self._prs.data.shape
@@ -843,47 +1141,8 @@ class TorchEngineInfra:
         self._build_farfield()
         self._collect_views()
 
-        self.pr_support = None
-        if bool(self.p.apply_probe_support):
-            self.pr_support = circular_support(
-                getattr(self.p, "probe_support", None),
-                (self.fny, self.fnx),
-                self.rdt,
-                self.dev,
-            )
-            if self.pr_support is None:
-                logger.warning(
-                    "apply_probe_support is set but probe_support = %s is not "
-                    "between 0 and 1, so no support is applied"
-                    % (getattr(self.p, "probe_support", None),)
-                )
-            else:
-                logger.info(
-                    f"probe support: circular, radius fraction "
-                    f"{float(self.p.probe_support):.3f}"
-                )
-
-
-        self._err_history = []
-        self._plot_int = max(0, int(self.p.plot_interval))
-        # Only when plotting is on: with plot_interval = 0 nothing is ever
-        # written there and the empty timestamped directory is pure litter.
-        if self._plot_int > 0:
-            os.makedirs(self.plot_progress_dir, exist_ok=True)
-
-    def _build_farfield(self):
-        """Extracts fw (forward) and bw (backward) far-field propagators from ptypy."""
-        pod = next(iter(next(iter(self.di.views.values())).pods.values()))
-        shape = (self.fny, self.fnx)
-        for tag, op in (("fw", pod.fw), ("bw", pod.bw)):
-            spec = extract_operator(op, shape, f"farfield {tag}")
-            setattr(
-                self, f"_ff_{tag}", to_torch(spec, self.cdt, self.dev)
-            )
-
-    @staticmethod
-    def _apply(spec, w):
-        return apply_torch(spec, w)
+        self._setup_probe_support()
+        self._setup_plot_state()
 
     def _collect_views(self):
         names = sorted(n for n, v in self.di.views.items() if v.active)
@@ -960,36 +1219,6 @@ class TorchEngineInfra:
         overrides this with the conjugate factor, -i.
         """
         return grad
-
-    def _display_object(self):
-        """Slice transmissions for plotting; the tangent subclass, which
-        stores log O, overrides this with the exponential."""
-        return self.ob_g
-
-    # Optional {"probe": ..., "phase": ...} colormap override; subclasses
-    # set it to restyle their progress figures without touching the helper.
-    PLOT_CMAPS = None
-
-    def _plot_progress(self):
-        plot_progress(
-            self.pr_g,
-            self._display_object(),
-            self.curiter,
-            self.plot_progress_dir,
-            psize=getattr(self.p, "psize", (1e-6, 1e-6)),
-            engine_name=type(self).__name__,
-            cmaps=self.PLOT_CMAPS,
-            zoom_center=self.p.get("plot_zoom_center", None),
-            phase_clim=self.p.get("plot_phase_clim", None),
-            scalebar=self.p.get("plot_scalebar", None),
-            phase_zero_top=bool(self.p.get("plot_phase_zero_top", False)),
-        )
-        plot_error_history(
-            self._err_history,
-            self.plot_progress_dir,
-            engine_name=type(self).__name__,
-            channels=self.p.get("plot_error_channels", None),
-        )
 
     def _write_slices(self):
         for i in range(self.p.number_of_slices):

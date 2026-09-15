@@ -3,14 +3,14 @@ ISS (Inter-slice Single Scattering) engine for ptychography.
 
 FORWARD MODEL
 -------------
-    g_j   = O_j - 1                                   (scattering perturbation)
-    phi_j = F^-1[ H_{z_j} F[P] ]                      (unscattered illumination)
-    psi   = P + sum_j F^-1[ H_{-z_j} F[ g_j phi_j ] ] (exit wave)
+    \Delta O_j   = O_j - 1                            (scattering perturbation)
+    P_j = F^-1[ H_{z_j} F[P] ]                        (unscattered illumination)
+    psi   = P + sum_j F^-1[ H_{-z_j} F[ \Delta O_j P_j ] ] (exit wave)
 
 with H_{z_j} = exp(2i pi (z_j/lam)(sqrt(1 - (lam f)^2) - 1)) and H_0 = 1, the whole
 model referred to the entrance plane.
 
-The slices enter as an affine SUM, not an ordered product. Because phi_j
+The slices enter as an affine SUM, not an ordered product. Because P_j
 depends only on the probe, it is computed exactly once per mini-batch.
 
 INVERSION & PRECONDITIONING
@@ -46,7 +46,7 @@ import numpy as np
 
 from ptypy import io
 from ptypy import utils as u
-from ptypy.custom.torch_engine_base import TorchEngineInfra
+from ptypy.custom.torch.base_torch import ISSEngineInfra
 from ptypy.engines import register, stochastic
 from ptypy.utils import Param
 from ptypy.utils.verbose import logger
@@ -227,7 +227,7 @@ def first_born_step_lowmem(
 #  ISS Engine wrapper                                                 #
 # ---------------------------------------------------------------------------#
 @register()
-class ISSTorch(TorchEngineInfra, stochastic.EPIE):
+class ISSTorch(ISSEngineInfra, stochastic.EPIE):
     """
     ISS multislice ptychography on the GPU.
 
@@ -340,15 +340,6 @@ class ISSTorch(TorchEngineInfra, stochastic.EPIE):
     type = float
     help = Floor on the 'local' denominator, as a fraction of its maximum
 
-    [apply_probe_support]
-    default = False
-    type = bool
-    help = Apply the circular probe support from p.probe_support
-    doc = This engine runs its own iteration loop and so never reaches
-          BaseEngine.support_constraint; without this flag p.probe_support is
-          accepted and ignored. Same name and meaning as in ThreePIETorch.
-          Leave False when comparing against an engine that has no support.
-
     [device]
     default = cuda
     type = str
@@ -382,19 +373,15 @@ class ISSTorch(TorchEngineInfra, stochastic.EPIE):
           for both engines, so that nothing but the thing under test differs.
 
     [plot_interval]
-    default = 3
+    default = 10
     type = int
     help = Iterations between diagnostic PNGs, 0 disables
     doc = Same name and meaning as in ThreePIETorch, so a paired comparison
-          plots on the same cadence from one setting.
+          plots on the same cadence from one setting. On by default: with no
+          explicit progress directory the figures and the terminal log land
+          in iteration_progress_<engine>_<stamp>/ in the working directory,
+          so every run leaves a browsable record.
 
-    [plot_error_channels]
-    default = fourier,photon,exit
-    type = str
-    help = Which error channels the convergence PNG draws
-    doc = Comma-separated subset of fourier, photon, exit. The error
-          HISTORY always records all three; this only selects what
-          error_history.png shows.
     """
 
     def __init__(self, ptycho_parent, pars=None):

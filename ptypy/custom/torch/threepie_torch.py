@@ -25,14 +25,13 @@ PRECONDITIONING THE SLICE UPDATES
            and divided once, which is the preconditioned mini-batch update.
 """
 
-import os
-from datetime import datetime
 
 import numpy as np
 
 from ptypy import io
 from ptypy.core import geometry
-from ptypy.custom import torch_engine_base
+from ptypy.custom.torch import base_torch
+from ptypy.custom.torch.base_torch import TorchMixin
 from ptypy.engines import register, stochastic
 from ptypy.utils import Param
 from ptypy.utils.verbose import logger
@@ -44,7 +43,7 @@ except ImportError:  # pragma: no cover
 
 
 @register()
-class ThreePIETorch(stochastic.EPIE):
+class ThreePIETorch(TorchMixin, stochastic.EPIE):
     """
     Batched GPU multislice ePIE.
 
@@ -181,13 +180,14 @@ class ThreePIETorch(stochastic.EPIE):
           must equal the true object can each legitimately exceed 1 when the
           gauge drifts, so clip the product's worth, not less.
 
-    [apply_probe_support]
-    default = False
-    type = bool
-    help = Apply the circular probe support from p.probe_support
-    doc = The CPU multislice engine never calls support_constraint, so leave
-          this False when comparing the two engines. BaseEngine's
-          p.probe_support defaults to 0.7.
+    [probe_support]
+    default = None
+    type = float, None
+    help = Circular probe support radius fraction; None disables
+    doc = BaseEngine's convention (set the fraction to enable), but the
+          default here is None rather than EPIE's 0.7: the CPU multislice
+          engine never calls support_constraint, so an off default keeps
+          paired comparisons support-free unless asked for.
 
     [sync_interval]
     default = 1
@@ -228,10 +228,7 @@ class ThreePIETorch(stochastic.EPIE):
         }
         self.ptycho.citations.add_article(**self.article)
 
-        # Local time on purpose: this names a run directory the user reads.
-        # The class name is in it so a folder of runs identifies its solver.
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")  # noqa: DTZ005
-        self.plot_progress_dir = f"iteration_progress_{type(self).__name__}_{stamp}"
+        self._stamp_plot_dir()
         self._warned_inactive_last = False
 
     # ------------------------------------------------------------------ #
@@ -240,23 +237,13 @@ class ThreePIETorch(stochastic.EPIE):
     def engine_initialize(self):
         super().engine_initialize()
 
-        if torch is None:
-            raise ImportError("ThreePIETorch requires PyTorch")
-
         N = int(self.p.number_of_slices)
 
-        # ---- device and dtype ----
-        want = str(self.p.device)
-        if want.startswith("cuda") and not torch.cuda.is_available():
-            logger.warning("CUDA unavailable, falling back to CPU")
-            want = "cpu"
-        self.dev = torch.device(want)
-        double = str(self.p.precision).lower().startswith("d")
-        self.cdt = torch.complex128 if double else torch.complex64
-        self.rdt = torch.float64 if double else torch.float32
+        self._setup_torch_device()
         logger.info(
             "ThreePIETorch on {}, {} precision".format(
-                self.dev, "double" if double else "single"
+                self.dev,
+                "double" if self.cdt == torch.complex128 else "single",
             )
         )
 
@@ -275,7 +262,6 @@ class ThreePIETorch(stochastic.EPIE):
         if self._denom not in ("max", "local", "unscattered"):
             raise ValueError("object_denom must be 'max', 'local' or 'unscattered'")
         self._reg = float(self.p.denom_reg)
-        self._plot_int = max(0, int(self.p.plot_interval))
         logger.info(
             "slice preconditioner: {}{}".format(
                 self._denom,
@@ -312,7 +298,7 @@ class ThreePIETorch(stochastic.EPIE):
             raise ValueError("slice_start_iteration must have length number_of_slices")
 
         # ---- ptypy containers, kept for saving and plotting ----
-        self._object = torch_engine_base.slice_containers(self.ob, N)
+        self._object = base_torch.slice_containers(self.ob, N)
 
         if len(self.ob.storages) != 1:
             raise NotImplementedError("ThreePIETorch supports a single object storage")
@@ -353,15 +339,8 @@ class ThreePIETorch(stochastic.EPIE):
         self._build_propagators()
         self._collect_views()
 
-        # ---- optional circular probe support (D8, opt-in) ----
-        self.pr_support = None
-        if bool(self.p.apply_probe_support):
-            ps = getattr(self.p, "probe_support", None)
-            self.pr_support = torch_engine_base.circular_support(
-                ps, (self.fny, self.fnx), self.rdt, self.dev
-            )
-            if self.pr_support is not None:
-                logger.info(f"probe support: circular, radius fraction {float(ps):.3f}")
+        # ---- circular probe support (D8; default None keeps CPU parity) ----
+        self._setup_probe_support()
 
         # sum_m |phi_i|^2 for object_denom='unscattered'; rebuilt whenever the
         # probe moves
@@ -389,9 +368,7 @@ class ThreePIETorch(stochastic.EPIE):
             self._order_gen.manual_seed(seed + 1)
             logger.info(f"seed = {seed}: the position order is reproducible")
 
-        self._err_history = []
-        os.makedirs(self.plot_progress_dir, exist_ok=True)
-
+        self._setup_plot_state()
 
     def _load_init_slices(self, path):
         """Replace the flat slice start with a stack read from an fslices .h5.
@@ -461,12 +438,12 @@ class ThreePIETorch(stochastic.EPIE):
             g.distance = t
             G = geometry.Geo(owner=None, pars=g)
             self._fw_spec.append(
-                torch_engine_base.extract_operator(
+                base_torch.extract_operator(
                     G.propagator.fw, shape, f"nearfield fw[{i}]"
                 )
             )
             self._bw_spec.append(
-                torch_engine_base.extract_operator(
+                base_torch.extract_operator(
                     G.propagator.bw, shape, f"nearfield bw[{i}]"
                 )
             )
@@ -479,20 +456,16 @@ class ThreePIETorch(stochastic.EPIE):
         if pod is None:
             raise RuntimeError("no active diffraction views")
 
-        self._ff_fw = torch_engine_base.extract_operator(pod.fw, shape, "farfield fw")
-        self._ff_bw = torch_engine_base.extract_operator(pod.bw, shape, "farfield bw")
+        self._ff_fw = base_torch.extract_operator(pod.fw, shape, "farfield fw")
+        self._ff_bw = base_torch.extract_operator(pod.bw, shape, "farfield bw")
 
         def to_g(spec):
-            return torch_engine_base.to_torch(spec, self.cdt, self.dev)
+            return base_torch.to_torch(spec, self.cdt, self.dev)
 
         self._fw_g = [to_g(s) for s in self._fw_spec]
         self._bw_g = [to_g(s) for s in self._bw_spec]
         self._ff_fw_g = to_g(self._ff_fw)
         self._ff_bw_g = to_g(self._ff_bw)
-
-    @staticmethod
-    def _apply(spec, w):
-        return torch_engine_base.apply_torch(spec, w)
 
     def _unscattered(self):
         """sum_m |phi_i|^2, the ISS denominator: the probe propagated to
@@ -628,10 +601,10 @@ class ThreePIETorch(stochastic.EPIE):
         if self._smooth_std:
             if self._smooth_w is None:
                 self._smooth_w = self._smooth_weight()
-            blurred = torch_engine_base.complex_gaussian_filter(self.ob_g, self._smooth_std)
+            blurred = base_torch.complex_gaussian_filter(self.ob_g, self._smooth_std)
             self.ob_g = self.ob_g + self._smooth_w * (blurred - self.ob_g)
         if self._clip is not None:
-            self.ob_g = torch_engine_base.clip_amplitude(self.ob_g, self._clip)
+            self.ob_g = base_torch.clip_amplitude(self.ob_g, self._clip)
 
     def _scatter_add(self, dst, idx, vals):
         B = idx.numel()
@@ -923,17 +896,3 @@ class ThreePIETorch(stochastic.EPIE):
 
         return super().engine_finalize()
 
-    def _plot_progress(self):
-        torch_engine_base.plot_progress(
-            self.pr_g,
-            self.ob_g,
-            self.curiter,
-            self.plot_progress_dir,
-            psize=getattr(self.p, "psize", (1e-6, 1e-6)),
-            engine_name=type(self).__name__,
-        )
-        torch_engine_base.plot_error_history(
-            self._err_history,
-            self.plot_progress_dir,
-            engine_name=type(self).__name__,
-        )

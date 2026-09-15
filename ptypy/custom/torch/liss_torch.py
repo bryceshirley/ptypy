@@ -1,5 +1,5 @@
 """
-ISS multislice with exact line searches, exploiting the affine model.
+ISS (Inter-Slice Single Scattering) with exact line searches, exploiting the affine model.
 
 WHY THIS CAN EXIST
 ------------------
@@ -46,7 +46,7 @@ object step, 2x when the probe updates too.
 
 import numpy as np
 
-from ptypy.custom.isstorch import ISSTorch
+from ptypy.custom.torch.iss_torch import ISSTorch
 from ptypy.engines import register
 from ptypy.utils.verbose import logger
 
@@ -82,14 +82,14 @@ def solve_step_cubic(c0, c1, c2, c3, Qfun, fallback):
 
 
 @register()
-class LSISSTorch(ISSTorch):
+class LISSTorch(ISSTorch):
     """
     ISS multislice with closed-form exact line searches.
 
     Defaults:
 
     [name]
-    default = LSISSTorch
+    default = LISSTorch
     type = str
     help = Engine identifier
 
@@ -547,11 +547,11 @@ class LSISSTorch(ISSTorch):
 
 
 @register()
-class LSISSTangentTorch(LSISSTorch):
+class LISSTangentTorch(LISSTorch):
     """
     Exact-line-search ISS with the tangent (linearised) perturbation.
 
-    Same relationship to LSISSTorch as ISSTangentTorch has to
+    Same relationship to LISSTorch as ISSTangentTorch has to
     ISSTorch: the reconstructed unknown is the scattering potential s
     with g = i s, the gradient direction picks up the -i chain-rule factor
     (projected onto the reals when potential_real), and the line search runs
@@ -564,7 +564,7 @@ class LSISSTangentTorch(LSISSTorch):
     Defaults:
 
     [name]
-    default = LSISSTangentTorch
+    default = LISSTangentTorch
     type = str
     help = Engine identifier
 

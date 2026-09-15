@@ -63,8 +63,8 @@ from matplotlib.colors import LogNorm
 from ptypy.engines import register
 from ptypy.utils.verbose import logger
 
-from . import issdiagnostics
-from .issdiagnostics import _jsonable
+from .. import issdiagnostics_torch
+from .issdiagnostics_torch import _jsonable
 
 try:
     import torch
@@ -78,7 +78,7 @@ except ImportError:  # pragma: no cover
 
 
 @register()
-class MultisliceSimulator(issdiagnostics.ISSDiagnostics):
+class MultisliceSimulator(issdiagnostics_torch.ISSDiagnostics):
     """
     Load a finished reconstruction, redistribute its particles over many
     layers, simulate detector data with exact multislice, and write a .ptyd
