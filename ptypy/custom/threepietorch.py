@@ -32,8 +32,7 @@ import numpy as np
 
 from ptypy import io
 from ptypy.core import geometry
-from ptypy.custom import torch_helpers
-from ptypy.custom.engine_hooks import EngineHooks
+from ptypy.custom import torch_engine_base
 from ptypy.engines import register, stochastic
 from ptypy.utils import Param
 from ptypy.utils.verbose import logger
@@ -45,7 +44,7 @@ except ImportError:  # pragma: no cover
 
 
 @register()
-class ThreePIETorch(stochastic.EPIE, EngineHooks):
+class ThreePIETorch(stochastic.EPIE):
     """
     Batched GPU multislice ePIE.
 
@@ -313,7 +312,7 @@ class ThreePIETorch(stochastic.EPIE, EngineHooks):
             raise ValueError("slice_start_iteration must have length number_of_slices")
 
         # ---- ptypy containers, kept for saving and plotting ----
-        self._object = torch_helpers.slice_containers(self.ob, N)
+        self._object = torch_engine_base.slice_containers(self.ob, N)
 
         if len(self.ob.storages) != 1:
             raise NotImplementedError("ThreePIETorch supports a single object storage")
@@ -358,7 +357,7 @@ class ThreePIETorch(stochastic.EPIE, EngineHooks):
         self.pr_support = None
         if bool(self.p.apply_probe_support):
             ps = getattr(self.p, "probe_support", None)
-            self.pr_support = torch_helpers.circular_support(
+            self.pr_support = torch_engine_base.circular_support(
                 ps, (self.fny, self.fnx), self.rdt, self.dev
             )
             if self.pr_support is not None:
@@ -393,7 +392,6 @@ class ThreePIETorch(stochastic.EPIE, EngineHooks):
         self._err_history = []
         os.makedirs(self.plot_progress_dir, exist_ok=True)
 
-        self.post_initialize()
 
     def _load_init_slices(self, path):
         """Replace the flat slice start with a stack read from an fslices .h5.
@@ -463,12 +461,12 @@ class ThreePIETorch(stochastic.EPIE, EngineHooks):
             g.distance = t
             G = geometry.Geo(owner=None, pars=g)
             self._fw_spec.append(
-                torch_helpers.extract_operator(
+                torch_engine_base.extract_operator(
                     G.propagator.fw, shape, f"nearfield fw[{i}]"
                 )
             )
             self._bw_spec.append(
-                torch_helpers.extract_operator(
+                torch_engine_base.extract_operator(
                     G.propagator.bw, shape, f"nearfield bw[{i}]"
                 )
             )
@@ -481,11 +479,11 @@ class ThreePIETorch(stochastic.EPIE, EngineHooks):
         if pod is None:
             raise RuntimeError("no active diffraction views")
 
-        self._ff_fw = torch_helpers.extract_operator(pod.fw, shape, "farfield fw")
-        self._ff_bw = torch_helpers.extract_operator(pod.bw, shape, "farfield bw")
+        self._ff_fw = torch_engine_base.extract_operator(pod.fw, shape, "farfield fw")
+        self._ff_bw = torch_engine_base.extract_operator(pod.bw, shape, "farfield bw")
 
         def to_g(spec):
-            return torch_helpers.to_torch(spec, self.cdt, self.dev)
+            return torch_engine_base.to_torch(spec, self.cdt, self.dev)
 
         self._fw_g = [to_g(s) for s in self._fw_spec]
         self._bw_g = [to_g(s) for s in self._bw_spec]
@@ -494,7 +492,7 @@ class ThreePIETorch(stochastic.EPIE, EngineHooks):
 
     @staticmethod
     def _apply(spec, w):
-        return torch_helpers.apply_torch(spec, w)
+        return torch_engine_base.apply_torch(spec, w)
 
     def _unscattered(self):
         """sum_m |phi_i|^2, the ISS denominator: the probe propagated to
@@ -630,10 +628,10 @@ class ThreePIETorch(stochastic.EPIE, EngineHooks):
         if self._smooth_std:
             if self._smooth_w is None:
                 self._smooth_w = self._smooth_weight()
-            blurred = torch_helpers.complex_gaussian_filter(self.ob_g, self._smooth_std)
+            blurred = torch_engine_base.complex_gaussian_filter(self.ob_g, self._smooth_std)
             self.ob_g = self.ob_g + self._smooth_w * (blurred - self.ob_g)
         if self._clip is not None:
-            self.ob_g = torch_helpers.clip_amplitude(self.ob_g, self._clip)
+            self.ob_g = torch_engine_base.clip_amplitude(self.ob_g, self._clip)
 
     def _scatter_add(self, dst, idx, vals):
         B = idx.numel()
@@ -650,7 +648,6 @@ class ThreePIETorch(stochastic.EPIE, EngineHooks):
         B = int(self.p.batch_size)
 
         for _ in range(num):
-            self.pre_iteration()
 
             if self.p.shuffle:
                 order = (
@@ -911,7 +908,6 @@ class ThreePIETorch(stochastic.EPIE, EngineHooks):
         slices_info.object_denom = self._denom
         slices_info.denom_reg = self._reg
         slices_info.seed = int(self.p.seed)
-        slices_info.update(self.extra_slices_info())
 
         slices_info.objects = {
             ob.ID: {ID: S._to_dict() for ID, S in ob.storages.items()}
@@ -928,7 +924,7 @@ class ThreePIETorch(stochastic.EPIE, EngineHooks):
         return super().engine_finalize()
 
     def _plot_progress(self):
-        torch_helpers.plot_progress(
+        torch_engine_base.plot_progress(
             self.pr_g,
             self.ob_g,
             self.curiter,
@@ -936,7 +932,7 @@ class ThreePIETorch(stochastic.EPIE, EngineHooks):
             psize=getattr(self.p, "psize", (1e-6, 1e-6)),
             engine_name=type(self).__name__,
         )
-        torch_helpers.plot_error_history(
+        torch_engine_base.plot_error_history(
             self._err_history,
             self.plot_progress_dir,
             engine_name=type(self).__name__,

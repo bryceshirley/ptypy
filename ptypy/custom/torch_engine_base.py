@@ -639,7 +639,7 @@ def _plot_progress_multi(pr_g, ob_g, curiter, outdir, psize, crop,
     plt.close(figp)
 
 
-def plot_error_history(err_history, outdir, engine_name=None):
+def plot_error_history(err_history, outdir, engine_name=None, channels=None):
     """
     Save the convergence curve for one run, overwriting on every call so the
     file in the progress folder is always the history so far.
@@ -652,6 +652,9 @@ def plot_error_history(err_history, outdir, engine_name=None):
     err_history  sequence of per-iteration error vectors, shape (n_iter, k)
     outdir       directory for the PNG (error_history.png)
     engine_name  solver that produced the errors, stated in the title
+    channels     which channels to draw: None (all recorded, the previous
+                 behaviour) or an iterable / comma-separated string of names
+                 from {fourier, photon, exit}
     """
     arr = np.asarray(err_history, dtype=float)
     if arr.ndim == 1:
@@ -660,8 +663,20 @@ def plot_error_history(err_history, outdir, engine_name=None):
         return
     it = np.arange(1, arr.shape[0] + 1)
     labels = ["fourier", "photon", "exit"]
+    if channels is None:
+        wanted = set(labels)
+    else:
+        if isinstance(channels, str):
+            channels = channels.split(",")
+        wanted = {str(c).strip().lower() for c in channels}
+        unknown = wanted - set(labels)
+        if unknown:
+            raise ValueError("unknown error channel(s) %s; choose from %s"
+                             % (sorted(unknown), labels))
     fig, ax = plt.subplots(figsize=(6.0, 4.0), dpi=150)
     for c in range(min(arr.shape[1], len(labels))):
+        if labels[c] not in wanted:
+            continue
         col = np.maximum(arr[:, c], 1e-30)
         if np.any(col > 1e-30):
             ax.semilogy(it, col, lw=1.4, label=labels[c])
@@ -675,3 +690,341 @@ def plot_error_history(err_history, outdir, engine_name=None):
     fig.tight_layout()
     fig.savefig(os.path.join(outdir, "error_history.png"))
     plt.close(fig)
+
+from datetime import datetime
+
+from ptypy import io
+from ptypy import utils as u
+from ptypy.utils import Param
+
+# ===========================================================================
+#  Shared torch infrastructure
+# ===========================================================================
+class TorchEngineInfra:
+    """Torch infrastructure shared by the ISS engines, gradient and
+    projection alike: device/dtype setup, object/probe tensors with warm
+    starts, propagator kernels, far-field extraction, view collection and
+    gather/scatter, the progress plotting, and the slice write-out.
+
+    Deliberately carries NO Defaults block and no engine base class: each
+    concrete engine brings its own parameter tree (stochastic for the
+    gradient engines, projectional for RAAR) and mixes this in for the
+    plumbing only.
+    """
+
+    PLOT_CMAPS = None
+
+    def _stamp_plot_dir(self):
+        # Local time on purpose: this names a run directory the user reads.
+        # The class name is in it so a folder of runs identifies its solver
+        # without the log (type(self) so subclasses label themselves).
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")  # noqa: DTZ005
+        self.plot_progress_dir = \
+            f"iteration_progress_{type(self).__name__}_{stamp}"
+
+    def _setup_torch_infra(self):
+        if torch is None:
+            raise ImportError("ISSTorch requires PyTorch")
+
+        N = self.p.number_of_slices
+        want = str(self.p.device)
+        if want.startswith("cuda") and not torch.cuda.is_available():
+            logger.warning("CUDA unavailable, falling back to CPU")
+            want = "cpu"
+        self.dev = torch.device(want)
+        dbl = str(self.p.precision).lower().startswith("d")
+        self.cdt = torch.complex128 if dbl else torch.complex64
+        self.rdt = torch.float64 if dbl else torch.float32
+
+        self._obs = next(iter(self.ob.storages.values()))
+        self._prs = next(iter(self.pr.storages.values()))
+        self.M, self.fny, self.fnx = self._prs.data.shape
+
+        # Initialize object slices and probe.
+        #
+        # The start is 1 + 1e-3 * uniform, symmetry-broken so the slices are not
+        # degenerate.  It is drawn from self.p.seed rather than from OS entropy:
+        # a paired comparison whose two runs begin from different objects has a
+        # twin-run difference that is not zero at iteration 0, which is usually
+        # the quantity being measured.  seed = 0 leaves the draw free, which is
+        # what the original engine did.
+        self._object = slice_containers(self.ob, N)
+        seed = int(self.p.seed)
+        ob0 = np.ones_like(self._obs.data[0])
+        rng = np.random.default_rng(seed if seed else None)
+        self.ob_g = torch.stack(
+            [
+                torch.as_tensor(
+                    ob0
+                    + 1e-3
+                    * (
+                        (rng.random(ob0.shape) - 0.5)
+                        + 1j * (rng.random(ob0.shape) - 0.5)
+                    ),
+                    dtype=self.cdt,
+                    device=self.dev,
+                )
+                for _ in range(N)
+            ]
+        )
+        logger.info(
+            "object start: 1 + 1e-3 noise, seed %s"
+            % (seed if seed else "free (not reproducible)")
+        )
+        self.pr_g = torch.as_tensor(
+            np.ascontiguousarray(self._prs.data), dtype=self.cdt, device=self.dev
+        )
+
+        # Warm start: overwrite the fresh object/probe init with a previous
+        # reconstruction so a run can continue where another stopped.
+        ws_ob = getattr(self.p, "warm_start_h5", None)
+        if ws_ob:
+            import h5py as _h5
+            with _h5.File(ws_ob, "r") as _f:
+                objs = _f["content/objects"]
+                keys = sorted(objs.keys(), key=lambda s: int(s.split("_")[-1]))
+                if len(keys) != N:
+                    raise ValueError(
+                        "warm_start_h5 has %d slices, engine wants %d"
+                        % (len(keys), N))
+                for i, k in enumerate(keys):
+                    arr = objs[k]["Sscan00G00"]["data"][()][0]
+                    self.ob_g[i] = torch.as_tensor(
+                        arr, dtype=self.cdt, device=self.dev)
+            logger.info("warm-start: loaded %d object slices from %s"
+                        % (N, ws_ob))
+        ws_pr = getattr(self.p, "warm_start_ptyr", None)
+        if ws_pr:
+            import h5py as _h5
+            with _h5.File(ws_pr, "r") as _f:
+                g = _f["content/probe"]
+                pk = list(g.keys())[0]
+                Pw = g[pk]["data"][()]
+            if Pw.shape != tuple(self.pr_g.shape):
+                raise ValueError("warm_start_ptyr probe shape %s != %s"
+                                 % (Pw.shape, tuple(self.pr_g.shape)))
+            self.pr_g = torch.as_tensor(Pw, dtype=self.cdt, device=self.dev)
+            logger.info("warm-start: loaded probe %s from %s"
+                        % (str(Pw.shape), ws_pr))
+
+        self._order_gen = None
+        if seed:
+            self._order_gen = torch.Generator(device=self.dev)
+            self._order_gen.manual_seed(seed + 1)
+            logger.info(f"seed = {seed}: the position order is reproducible")
+        self.ony, self.onx = self.ob_g.shape[-2:]
+
+        # Precompute Free-Space Propagators (H_z and H_{-z})
+        geom = next(iter(self.ptycho.model.scans.values())).geometries[0]
+        V, W = u.grids(geom.shape, geom.lam / geom.shape[0] / geom.resolution, "fft")
+        a2 = V**2 + W**2
+        z_depths = [
+            sum(self.p.slice_thickness[:i])
+            if isinstance(self.p.slice_thickness, (list, tuple))
+            else i * self.p.slice_thickness
+            for i in range(1, N)
+        ]
+
+        H = np.empty((max(N - 1, 1), *geom.shape), dtype=np.complex128)
+        for i, zi in enumerate(z_depths):
+            kz = np.sqrt(np.maximum(1.0 - a2, 0.0)) - 1.0
+            H[i] = np.exp(2j * np.pi * (zi / geom.lam) * kz) * (a2 <= 1.0)
+
+        self.H = torch.as_tensor(H[: N - 1], dtype=self.cdt, device=self.dev)
+        self.Hb = self.H.conj().contiguous() if N > 1 else self.H
+
+        # Build fully broadcastable H arrays for pure math function
+        self.H_fwd = torch.ones((N, 1, 1, *geom.shape), dtype=self.cdt, device=self.dev)
+        self.H_rev = torch.ones((N, 1, 1, *geom.shape), dtype=self.cdt, device=self.dev)
+        if N > 1:
+            self.H_fwd[1:, 0, 0] = self.H
+            self.H_rev[1:, 0, 0] = self.Hb
+
+        self._build_farfield()
+        self._collect_views()
+
+        self.pr_support = None
+        if bool(self.p.apply_probe_support):
+            self.pr_support = circular_support(
+                getattr(self.p, "probe_support", None),
+                (self.fny, self.fnx),
+                self.rdt,
+                self.dev,
+            )
+            if self.pr_support is None:
+                logger.warning(
+                    "apply_probe_support is set but probe_support = %s is not "
+                    "between 0 and 1, so no support is applied"
+                    % (getattr(self.p, "probe_support", None),)
+                )
+            else:
+                logger.info(
+                    f"probe support: circular, radius fraction "
+                    f"{float(self.p.probe_support):.3f}"
+                )
+
+
+        self._err_history = []
+        self._plot_int = max(0, int(self.p.plot_interval))
+        # Only when plotting is on: with plot_interval = 0 nothing is ever
+        # written there and the empty timestamped directory is pure litter.
+        if self._plot_int > 0:
+            os.makedirs(self.plot_progress_dir, exist_ok=True)
+
+    def _build_farfield(self):
+        """Extracts fw (forward) and bw (backward) far-field propagators from ptypy."""
+        pod = next(iter(next(iter(self.di.views.values())).pods.values()))
+        shape = (self.fny, self.fnx)
+        for tag, op in (("fw", pod.fw), ("bw", pod.bw)):
+            spec = extract_operator(op, shape, f"farfield {tag}")
+            setattr(
+                self, f"_ff_{tag}", to_torch(spec, self.cdt, self.dev)
+            )
+
+    @staticmethod
+    def _apply(spec, w):
+        return apply_torch(spec, w)
+
+    def _collect_views(self):
+        names = sorted(n for n, v in self.di.views.items() if v.active)
+        rows, cols, amps, masks = [], [], [], []
+        trivial = True
+        for n in names:
+            pod = next(iter(self.di.views[n].pods.values()))
+            lo = np.asarray(pod.ob_view.dlow, dtype=np.int64)
+            rows.append(np.arange(lo[0], lo[0] + self.fny))
+            cols.append(np.arange(lo[1], lo[1] + self.fnx))
+            I = np.asarray(self.di.views[n].data, dtype=np.float64)
+            amps.append(np.sqrt(np.maximum(I, 0.0)))
+            m = (
+                np.ones_like(I, dtype=bool)
+                if pod.mask is None
+                else np.asarray(pod.mask) > 0
+            )
+            trivial = trivial and bool(m.all())
+            masks.append(m)
+
+        self.n_pos = len(names)
+        self.rows = torch.as_tensor(np.stack(rows), dtype=torch.long, device=self.dev)
+        self.cols = torch.as_tensor(np.stack(cols), dtype=torch.long, device=self.dev)
+        self.amp_dat = torch.as_tensor(np.stack(amps), dtype=self.rdt, device=self.dev)
+        self.maskb = (
+            None
+            if trivial
+            else torch.as_tensor(np.stack(masks), dtype=torch.bool, device=self.dev)
+        )
+        self.view_names = names
+
+        # Illuminated region.  Any statistic taken over a slice is meaningless
+        # outside it: most of the object array is never touched and stays at
+        # exactly 1, which would drag every rms towards zero by an arbitrary
+        # factor.  Read from outside the engine, by diagnostics.
+        cov = torch.zeros((self.ony, self.onx), dtype=self.rdt, device=self.dev)
+        for s in range(0, self.n_pos, 256):
+            idx = torch.arange(s, min(s + 256, self.n_pos), device=self.dev)
+            B = idx.numel()
+            self._scatter(
+                cov,
+                self._flat(idx),
+                torch.ones((B, self.fny, self.fnx), dtype=self.rdt, device=self.dev),
+            )
+        self.cov = cov > 0
+
+    def _flat(self, idx):
+        return (
+            self.rows[idx][:, :, None] * self.onx + self.cols[idx][:, None, :]
+        ).reshape(-1)
+
+    def _gather(self, arr, flat, B):
+        return arr.reshape(-1)[flat].view(B, self.fny, self.fnx)
+
+    def _scatter(self, dst, flat, vals):
+        dst.view(-1).index_put_((flat,), vals.reshape(-1), accumulate=True)
+
+    def _model_object(self, O_patches):
+        """What the forward core sees as the slice transmissions.
+
+        The chord engine stores the transmissions O_j themselves, so this is
+        the identity and the core's g = O - 1 is the chord perturbation. The
+        tangent subclass stores the scattering potential s_j instead and
+        returns 1 + i s_j, so the same core computes g = i s_j: the
+        linearised transmission.
+        """
+        return O_patches
+
+    def _grad_to_param(self, grad):
+        """Chain rule from the model perturbation g to the stored parameter.
+
+        The chord engine's parameter is O with g = O - 1, so dg/dO = 1 and
+        this is the identity. The tangent subclass stores s with g = i s and
+        overrides this with the conjugate factor, -i.
+        """
+        return grad
+
+    def _display_object(self):
+        """Slice transmissions for plotting; the tangent subclass, which
+        stores log O, overrides this with the exponential."""
+        return self.ob_g
+
+    # Optional {"probe": ..., "phase": ...} colormap override; subclasses
+    # set it to restyle their progress figures without touching the helper.
+    PLOT_CMAPS = None
+
+    def _plot_progress(self):
+        plot_progress(
+            self.pr_g,
+            self._display_object(),
+            self.curiter,
+            self.plot_progress_dir,
+            psize=getattr(self.p, "psize", (1e-6, 1e-6)),
+            engine_name=type(self).__name__,
+            cmaps=self.PLOT_CMAPS,
+            zoom_center=self.p.get("plot_zoom_center", None),
+            phase_clim=self.p.get("plot_phase_clim", None),
+            scalebar=self.p.get("plot_scalebar", None),
+            phase_zero_top=bool(self.p.get("plot_phase_zero_top", False)),
+        )
+        plot_error_history(
+            self._err_history,
+            self.plot_progress_dir,
+            engine_name=type(self).__name__,
+            channels=self.p.get("plot_error_channels", None),
+        )
+
+    def _write_slices(self):
+        for i in range(self.p.number_of_slices):
+            arr = self.ob_g[i].cpu().numpy()
+            for st in self._object[i].storages.values():
+                st.data[0][:] = arr
+        self._prs.data[:] = self.pr_g.cpu().numpy()
+
+        self.ob.fill(self._object[0])
+        for i in range(1, self.p.number_of_slices):
+            self.ob *= self._object[i]
+
+        info = Param(
+            number_of_slices=self.p.number_of_slices,
+            slice_thickness=self.p.slice_thickness,
+            batch_size=self.p.get("batch_size", None),
+            alpha=self.p.get("alpha", None),
+            objects={
+                ob.ID: {ID: S._to_dict() for ID, S in ob.storages.items()}
+                for ob in self._object
+            },
+        )
+
+        # We must tell ptypy to ignore its own custom class types when saving to HDF5
+        h5opt = io.h5options["UNSUPPORTED"]
+        io.h5options["UNSUPPORTED"] = "ignore"
+
+        logger.info(f"saving slices to {self.p.fslices}")
+        io.h5write(
+            self.p.fslices,
+            header={"description": "ISS multislice"},
+            content=info,
+        )
+
+        io.h5options["UNSUPPORTED"] = h5opt
+
+
+

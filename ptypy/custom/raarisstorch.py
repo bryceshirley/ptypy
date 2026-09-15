@@ -30,10 +30,10 @@ psi = P + w, which is the acceptance test for this engine.
 The RAAR iterate is W; the overlap solve never overwrites W (exactly as
 pod.exit is the iterate in ptypy's projection engines).
 
-Inherited but IGNORED parent parameters: alpha, batch_size, shuffle,
-momentum, born_mode, probe_update_interval, object_denom, denom_reg,
-probe_converged_rtol. The parent's [beta] (a probe step size) is
-repurposed here with the RAAR meaning. Single MPI rank only.
+Parameter tree: ptypy's projection family (RAAR relaxation [beta] from
+RAARMixin; pbound, overlap and inertia parameters from
+_ProjectionEngine) plus the engine-owned entries below -- no gradient/
+stochastic parameters exist on this engine. Single MPI rank only.
 
 Defaults:
 
@@ -42,60 +42,61 @@ default = RAARISSTorch
 type = str
 help = Engine identifier
 
-[beta]
-default = 0.9
-type = float
-lowlim = 0.0
-help = RAAR relaxation parameter
-doc = Maps to the generalized projection coefficients
-  (a, b, c) = (1 - 2 beta, beta, 2). Replaces the parent's probe step
-  size, which this engine does not use.
-
-[update_object_first]
-default = True
-type = bool
-help = Update object before probe in the overlap loop
-
-[overlap_max_iterations]
-default = 10
+[number_of_slices]
+default = 2
 type = int
-help = Maximum iterations of the overlap (object/probe) inner loop
+help = Number of object slices
 
-[overlap_converge_factor]
-default = 0.05
+[slice_thickness]
+default = 1e-6
 type = float
-help = Exit the overlap loop when the relative probe change falls below this
+help = Inter-slice spacing [m]; a list gives per-gap spacings
 
-[object_inertia]
-default = 1e-4
-type = float
-help = Object inertia (cfact fraction of the mean diffraction power)
+[fslices]
+default = slices.h5
+type = str
+help = File to which the reconstructed slices are written
 
-[probe_inertia]
-default = 1e-9
-type = float
-help = Probe inertia
+[device]
+default = cuda
+type = str
+help = Torch device: 'cuda', 'cuda:0' or 'cpu'
 
-[fourier_power_bound]
+[precision]
+default = single
+type = str
+help = 'single' (complex64) or 'double' (complex128)
+
+[seed]
+default = 123
+type = int
+help = Seed for the object start; 0 leaves it free
+
+[plot_interval]
+default = 0
+type = int
+help = Iterations between diagnostic PNGs, 0 disables
+
+[plot_error_channels]
+default = fourier,photon,exit
+type = str
+help = Which error channels the convergence PNG draws
+
+[apply_probe_support]
+default = False
+type = bool
+help = Apply the circular probe support (radius fraction probe_support)
+  inside the torch probe update
+
+[warm_start_h5]
 default = None
-type = float
-help = Fourier power bound (pbound); None derives it from fourier_relax_factor
+type = str
+help = Optional fslices-format h5 with per-slice object warm start
 
-[fourier_relax_factor]
-default = 0.05
-type = float
-help = Sets the pbound as in the ptypy projection engines when
-  fourier_power_bound is None
-
-[obj_smooth_std]
+[warm_start_ptyr]
 default = None
-type = float
-help = Gaussian smoothing (pixels) of the object prior to its update
-
-[clip_object]
-default = None
-type = tuple
-help = Clip the object amplitude into this interval
+type = str
+help = Optional .ptyr whose probe overwrites the initial probe
 
 [chunk_size]
 default = 32
@@ -179,8 +180,9 @@ help = Explicit generalized-projection coefficients (a, b, c), overriding
 
 import numpy as np
 
-from ptypy.custom import torch_helpers
-from ptypy.custom.isstorch import ISSTorch
+from ptypy.custom import torch_engine_base
+from ptypy.custom.torch_engine_base import TorchEngineInfra
+from ptypy.engines import projectional
 from ptypy.engines import register
 from ptypy.utils.verbose import logger
 
@@ -285,16 +287,19 @@ def raar_fourier_chunk(W, PO, a_det, fmag, fmask, pbound, coeffs,
 #  Engine
 # ===========================================================================
 @register()
-class RAARISSTorch(ISSTorch):
+class RAARISSTorch(TorchEngineInfra, projectional.RAAR):
     __doc__ = __doc__
 
-    SUPPORTED_MODELS = ISSTorch.SUPPORTED_MODELS
-
-    # campaign palette: inferno probe; grey phase panels (Bryce's pick)
+    # campaign palette: inferno probe; grey phase panels
     PLOT_CMAPS = {"probe": "inferno", "phase": "Greys_r"}
+
+    def __init__(self, ptycho_parent, pars=None):
+        super().__init__(ptycho_parent, pars)
+        self._stamp_plot_dir()
 
     def engine_initialize(self):
         super().engine_initialize()
+        self._setup_torch_infra()
         N = self.p.number_of_slices
 
         # Staging: run the first stage_iterations at N = 1 (slice 0 only),
@@ -445,17 +450,15 @@ class RAARISSTorch(ISSTorch):
 
     # -- prepare ---------------------------------------------------------------
     def engine_prepare(self):
+        # _ProjectionEngine computes pbound_scan (power bound per scan,
+        # explicit fourier_power_bound or derived from fourier_relax_factor)
+        # and mean_power; consume them instead of re-deriving.
         super().engine_prepare()
         pb = np.empty(self.n_pos)
-        explicit = self.p.fourier_power_bound
         for i, n in enumerate(self.view_names):
-            s = self.di.views[n].storage
-            pb[i] = (.25 * self.p.fourier_relax_factor**2 * s.pbound_stub
-                     if explicit is None else explicit)
+            pb[i] = self.pbound_scan[self.di.views[n].storage.label]
         self.pbound = torch.as_tensor(pb, dtype=self.rdt, device=self.dev)
-        mean_power = np.mean([s.mean_power
-                              for s in self.di.storages.values()])
-        self._cfact_ob = float(self.p.object_inertia) * float(mean_power)
+        self._cfact_ob = float(self.p.object_inertia) * float(self.mean_power)
         self._cfact_pr = (float(self.p.probe_inertia)
                           * self.n_pos / max(1, self.M))
 
@@ -477,7 +480,6 @@ class RAARISSTorch(ISSTorch):
     # -- the iteration -----------------------------------------------------------
     def engine_iterate(self, num=1):
         for _ in range(num):
-            self.pre_iteration()
             if (self._Na < self.p.number_of_slices
                     and self.curiter >= self._stage_until):
                 self._expand_stage()
@@ -509,7 +511,7 @@ class RAARISSTorch(ISSTorch):
                 Wc, PO, self._a_det, fmag, fmask, self.pbound[idx],
                 self._coeffs, self.H_fwd[:Na], self.H_rev[:Na],
                 self._Sdiag,
-                self._ff_fw, self._ff_bw, torch_helpers.apply_torch,
+                self._ff_fw, self._ff_bw, torch_engine_base.apply_torch,
                 compute_ll=bool(self.p.compute_log_likelihood))
             self.W[idx.to(self._wave_dev), :Na] = Wn.to(self._wave_dev)
             # fused overlap numerator: the same chunk that was just
@@ -542,7 +544,7 @@ class RAARISSTorch(ISSTorch):
         g_old = self.ob_g[:Na] - 1.0
         std = self.p.obj_smooth_std
         if std:
-            g_old = torch_helpers.complex_gaussian_filter(g_old, float(std))
+            g_old = torch_engine_base.complex_gaussian_filter(g_old, float(std))
         if not self._acc_valid:
             # W or phi changed since the Fourier pass (probe update):
             # re-accumulate the numerator with the current state.
@@ -565,7 +567,7 @@ class RAARISSTorch(ISSTorch):
         # O = 1 + g. A tangent subclass would need to override this solve.
         self.ob_g = torch.cat([1.0 + g_new, self.ob_g[Na:]], dim=0)
         if self.p.clip_object is not None:
-            self.ob_g = torch_helpers.clip_amplitude(
+            self.ob_g = torch_engine_base.clip_amplitude(
                 self.ob_g, self.p.clip_object)
 
     def _probe_update(self):
@@ -641,4 +643,5 @@ class RAARISSTorch(ISSTorch):
 
     def engine_finalize(self):
         del self.W
+        self._write_slices()
         return super().engine_finalize()

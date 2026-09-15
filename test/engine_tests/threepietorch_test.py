@@ -3,7 +3,7 @@ Parity of the torch multislice ePIE engine against the numpy one.
 
 Reference    ptypy/custom/threepie.py       ThreePIE, numpy, subclass of EPIE
 Under test   ptypy/custom/threepietorch.py  ThreePIETorch, per-slice state in torch
-Shared       ptypy/custom/torch_helpers.py  propagator extraction
+Shared       ptypy/custom/torch_engine_base.py  propagator extraction
 
 The suite is in five layers, cheapest first, so that a failure points at one
 thing:
@@ -66,7 +66,7 @@ except ImportError:
     HAVE_TORCH = False
 
 if HAVE_TORCH:
-    from ptypy.custom import torch_helpers
+    from ptypy.custom import torch_engine_base
     from ptypy.custom.threepietorch import ThreePIETorch
 
 
@@ -217,7 +217,7 @@ class _ParityFixture(unittest.TestCase):
         The numpy engine first, on purpose.
 
         ThreePIE names its slice containers `<Cobj>_o_<i>` unconditionally;
-        torch_helpers.slice_containers steps around a name already taken. Built
+        torch_engine_base.slice_containers steps around a name already taken. Built
         the other way round, ThreePIE walks into ptypy's duplicate-container
         UnboundLocalError.
         """
@@ -310,7 +310,7 @@ class PropagatorParityTest(unittest.TestCase):
     The near-field propagator the two engines put between slices.
 
     ThreePIE keeps ptypy's Geo.propagator and calls it; ThreePIETorch recovers
-    the same operator numerically with torch_helpers.extract_operator and
+    the same operator numerically with torch_engine_base.extract_operator and
     applies it with torch FFTs. Both build the Geo with owner=None, so ptypy
     hands both of them a complex64 kernel -- the single-precision kernel is
     shared, not a difference between the engines.
@@ -333,11 +333,11 @@ class PropagatorParityTest(unittest.TestCase):
 
     def _torch_pair(self, G):
         dev = torch.device("cpu")
-        fw = torch_helpers.to_torch(
-            torch_helpers.extract_operator(G.propagator.fw, self.SHAPE),
+        fw = torch_engine_base.to_torch(
+            torch_engine_base.extract_operator(G.propagator.fw, self.SHAPE),
             torch.complex128, dev)
-        bw = torch_helpers.to_torch(
-            torch_helpers.extract_operator(G.propagator.bw, self.SHAPE),
+        bw = torch_engine_base.to_torch(
+            torch_engine_base.extract_operator(G.propagator.bw, self.SHAPE),
             torch.complex128, dev)
         return fw, bw
 
@@ -350,7 +350,7 @@ class PropagatorParityTest(unittest.TestCase):
             for name, ref, spec in (("fw", G.propagator.fw, fw),
                                     ("bw", G.propagator.bw, bw)):
                 want = ref(w)
-                got = torch_helpers.apply_torch(
+                got = torch_engine_base.apply_torch(
                     spec, torch.as_tensor(w)).numpy()
                 err = np.abs(got - want).max() / np.abs(want).max()
                 self.assertLess(err, 1e-12,
@@ -373,9 +373,9 @@ class PropagatorParityTest(unittest.TestCase):
         for name, got in (
                 ("ptypy fw", G.propagator.fw(w)),
                 ("ptypy bw", G.propagator.bw(w)),
-                ("torch fw", torch_helpers.apply_torch(
+                ("torch fw", torch_engine_base.apply_torch(
                     fw, torch.as_tensor(w)).numpy()),
-                ("torch bw", torch_helpers.apply_torch(
+                ("torch bw", torch_engine_base.apply_torch(
                     bw, torch.as_tensor(w)).numpy())):
             err = np.abs(got - w).max() / np.abs(w).max()
             self.assertLess(err, 1e-9,
@@ -386,8 +386,8 @@ class PropagatorParityTest(unittest.TestCase):
         w = self._rand(self.SHAPE)
         G = self._geo(DZ[0])
         fw, bw = self._torch_pair(G)
-        back = torch_helpers.apply_torch(
-            bw, torch_helpers.apply_torch(fw, torch.as_tensor(w))).numpy()
+        back = torch_engine_base.apply_torch(
+            bw, torch_engine_base.apply_torch(fw, torch.as_tensor(w))).numpy()
         self.assertLess(np.abs(back - w).max() / np.abs(w).max(), 1e-6)
 
 
@@ -639,7 +639,7 @@ class DegenerateCaseTest(_ParityFixture):
             want = geometry.Geo(owner=None, pars=g).propagator.fw(w)
             self.assert_close(en.fw[i](w), want, f"numpy fw[{i}]", rtol=1e-12)
             self.assert_close(
-                torch_helpers.apply_torch(et._fw_g[i], torch.as_tensor(w)).numpy(),
+                torch_engine_base.apply_torch(et._fw_g[i], torch.as_tensor(w)).numpy(),
                 want, f"torch fw[{i}]", rtol=1e-12)
             # and the other thickness must NOT reproduce it
             other = DZ[1 - i]
@@ -970,7 +970,7 @@ class ObjectRegularisationTest(_ParityFixture):
         return self.torch_engine(P, **_pars(2, 1e-6, **kw))
 
     def test_the_filter_matches_the_one_ptypy_already_uses(self):
-        """torch_helpers.complex_gaussian_filter vs accelerate.base.array_utils.
+        """torch_engine_base.complex_gaussian_filter vs accelerate.base.array_utils.
 
         The projectional engines' obj_smooth_std is defined by that numpy
         filter, so a differently-shaped blur here would make the same parameter
@@ -978,7 +978,7 @@ class ObjectRegularisationTest(_ParityFixture):
         single reflection silently truncates the kernel.
         """
         from ptypy.accelerate.base.array_utils import complex_gaussian_filter as ref
-        from ptypy.custom.torch_helpers import complex_gaussian_filter as got
+        from ptypy.custom.torch_engine_base import complex_gaussian_filter as got
 
         rng = np.random.default_rng(0)
         for shape, std in (((1, 64, 64), 3.0), ((3, 40, 28), 7.5),
@@ -995,7 +995,7 @@ class ObjectRegularisationTest(_ParityFixture):
         A filter that normalises badly, or pads with zeros, eats the edge of a
         flat field; that would show up as a dark rim on every reconstruction.
         """
-        from ptypy.custom.torch_helpers import complex_gaussian_filter as got
+        from ptypy.custom.torch_engine_base import complex_gaussian_filter as got
 
         flat = torch.full((2, 48, 37), 0.7 - 0.3j, dtype=torch.complex128)
         self.assertTrue(torch.allclose(got(flat, 9.0), flat, atol=1e-14))

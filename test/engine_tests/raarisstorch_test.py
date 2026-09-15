@@ -149,7 +149,7 @@ def _torch_pars(**kw):
                    device="cpu", precision="double", seed=1,
                    chunk_size=16, object_init="container",
                    exit_init="model", wave_device="same", plot_interval=0,
-                   batch_size=16, fslices="/tmp/raar_test_fslices.h5",
+                   fslices="/tmp/raar_test_fslices.h5",
                    **_COMMON)
     pars.update(kw)
     return pars
