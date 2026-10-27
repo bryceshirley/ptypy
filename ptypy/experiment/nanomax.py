@@ -13,6 +13,7 @@ except ImportError:
     logger.warning('Couldnt find hdf5plugin - better hope your h5py has bitshuffle!')
 import h5py
 import os.path
+from PIL import Image
 
 @register()
 class NanomaxStepscanNov2018(PtyScan):
@@ -918,9 +919,9 @@ class NanomaxContrast(NanomaxStepscanSep2019):
 
         # check if certain scan position indicees are exluded
         if self.info.ingnore_first_N != None:
-            position_mask[self.info.ingnore_first_N:] = 0
-        if self.info.ingnore_beyond_N != None:    
-            position_mask[:self.info.ingnore_beyond_N] = 0
+            position_mask[:self.info.ingnore_first_N] = 0
+        if self.info.ingnore_beyond_N != None:
+            position_mask[self.info.ingnore_beyond_N:] = 0
 
         # room for more sophisticated rules if needed
 

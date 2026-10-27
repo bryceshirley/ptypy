@@ -6,11 +6,16 @@ on:
   push:
     branches:
       - master
+    paths-ignore:
+      - "docs/**"
+      - ".github/workflows/**"
   pull_request:
     branches:
       - master
       - dev
       - hotfixes
+    paths-ignore:
+      - "docs/**"
   # Also trigger on page_build, as well as release created events
   page_build:
   release:
@@ -24,26 +29,25 @@ jobs:
       run:
         shell: bash -el {0}
     strategy:
-      max-parallel: 10
+      max-parallel: 4
       fail-fast: false
       matrix:
         python-version:
-          - "3.9"
-          - "3.10"
           - "3.11"
           - "3.12"
           - "3.13"
+          - "3.14"
         conda-env:
           - "core"
           - "full"
     name: Python ${{ matrix.python-version }} and ${{ matrix.conda-env }} dependencies
     steps:
     - name: Checkout
-      uses: actions/checkout@v4
-    - uses: conda-incubator/setup-miniconda@v3
+      uses: actions/checkout@v7
+    - uses: conda-incubator/setup-miniconda@v4.0.1
       with:
         auto-update-conda: true
-        auto-activate-base: false
+        auto-activate: false
         conda-remove-defaults: true
         channels: conda-forge
         activate-environment: ptypy_env

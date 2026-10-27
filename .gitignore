@@ -35,3 +35,5 @@ result/
 iteration_progress*/
 .claude/
 ISS-work/
+.venv/
+docs/_build

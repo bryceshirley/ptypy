@@ -1,0 +1,34 @@
+name: Documentation
+
+on:
+  push:
+    branches:
+      - dev
+      - master
+
+jobs:
+  legacy_docs:
+    uses: ./.github/workflows/_build_legacy_docs.yaml
+    with: 
+      tag: legacy
+
+  new_docs_master:
+    uses: ./.github/workflows/_build_docs.yaml
+    with:
+      tag: master
+
+  new_docs_dev:
+    uses: ./.github/workflows/_build_docs.yaml
+    with:
+      tag: dev
+
+  switcher:
+    uses: ./.github/workflows/_switcher.yaml
+    needs:
+      - legacy_docs
+      - new_docs_master
+      - new_docs_dev
+
+  github_pages:
+    needs: switcher
+    uses: ./.github/workflows/_github_pages.yaml
