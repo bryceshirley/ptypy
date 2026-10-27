@@ -37,3 +37,5 @@ iteration_progress*/
 ISS-work/
 .venv/
 docs/_build
+runs/
+runs_*.log
