@@ -349,12 +349,9 @@ class FirstBornEngineTest(unittest.TestCase):
         p.slice_thickness = 1e-6
         p.device = "cpu"
         p.precision = "double"
-        p.batch_size = 8
         p.probe_update_start = 2
         p.plot_interval = 0
         p.seed = 3
-        p.object_denom = "local"
-        p.denom_reg = 0.01
         p.update(kw)
         return p
 

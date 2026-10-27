@@ -148,81 +148,6 @@ def first_born_step(
     return grad_g, K_O, grad_P, K_P, r_field, I_mod
 
 
-def first_born_step_lowmem(
-    O, P, I_dat, H_fwd, H_rev, ff_fw, ff_bw, mask=None, calc_probe_grad=True,
-    phi=None,
-):
-    """
-    first_born_step evaluated slice by slice: same arithmetic, same returns,
-    but the (N, B, M, Ny, Nx) workspaces of the parallel version never exist.
-    Peak memory is (B, M, Ny, Nx) plus the (N, B, Ny, Nx) gradient output, so
-    the batch can grow by roughly a factor N on the same GPU, paid for with a
-    Python loop over slices.
-
-    phi : optional precomputed unscattered illumination [N, M, Ny, Nx]; pass
-    it once the probe is frozen so it is not recomputed per batch.
-    """
-    has_batch = O.ndim == 4
-    if not has_batch:
-        O = O.unsqueeze(1)
-        I_dat = I_dat.unsqueeze(0)
-        if mask is not None:
-            mask = mask.unsqueeze(0)
-
-    N, B = O.shape[0], O.shape[1]
-    M, ny, nx = P.shape
-
-    # Unscattered illumination at every slice: no batch dimension, so this
-    # stays small at any N.
-    if phi is None:
-        P_f = torch.fft.fft2(P)
-        phi = torch.fft.ifft2(H_fwd[:, 0] * P_f.unsqueeze(0))  # [N, M, Ny, Nx]
-
-    # ---- forward: accumulate the scattered field in the frequency domain ---
-    acc = torch.zeros((B, M, ny, nx), dtype=O.dtype, device=O.device)
-    for j in range(N):
-        acc += H_rev[j, 0] * torch.fft.fft2((O[j] - 1.0).unsqueeze(1) * phi[j])
-    psi = P.unsqueeze(0) + torch.fft.ifft2(acc)
-    del acc
-
-    # ---- detector projection: identical to the parallel core ---------------
-    F_psi = ff_fw(psi)
-    I_mod = torch.sum(F_psi.real.square() + F_psi.imag.square(), dim=1)
-    fac = torch.sqrt(I_dat / I_mod.clamp_min(1e-12)) - 1.0
-    if mask is not None:
-        fac = torch.where(mask > 0, fac, torch.zeros_like(fac))
-    r_field = ff_bw(F_psi * fac.unsqueeze(1))  # [B, M, Ny, Nx]
-
-    # ---- adjoint, slice by slice -------------------------------------------
-    r_field_f = torch.fft.fft2(r_field)
-    grad_g = torch.empty((N, B, ny, nx), dtype=O.dtype, device=O.device)
-    K_O = torch.empty((N, ny, nx), dtype=I_dat.dtype, device=O.device)
-    acc_P = (torch.zeros((B, M, ny, nx), dtype=O.dtype, device=O.device)
-             if calc_probe_grad else None)
-    for j in range(N):
-        r_j = torch.fft.ifft2(H_fwd[j, 0] * r_field_f)
-        grad_g[j] = (phi[j].conj().unsqueeze(0) * r_j).sum(dim=1)
-        K_O[j] = (phi[j].real.square() + phi[j].imag.square()).sum(dim=0)
-        if calc_probe_grad:
-            acc_P += H_rev[j, 0] * torch.fft.fft2(
-                (O[j] - 1.0).conj().unsqueeze(1) * r_j)
-        del r_j
-
-    if calc_probe_grad:
-        grad_P = (r_field + torch.fft.ifft2(acc_P)).sum(dim=0)
-        K_P = torch.sum(O.real.square() + O.imag.square(), dim=(0, 1))
-    else:
-        grad_P, K_P = None, None
-
-    if not has_batch:
-        grad_g = grad_g.squeeze(1)
-        r_field = r_field.squeeze(0)
-        I_mod = I_mod.squeeze(0)
-
-    return grad_g, K_O, grad_P, K_P, r_field, I_mod
-
-
-
 # ---------------------------------------------------------------------------#
 #  ISS Engine wrapper                                                 #
 # ---------------------------------------------------------------------------#
@@ -273,36 +198,14 @@ class ISSTorch(ISSEngineInfra, stochastic.EPIE):
     default = 1.0
     type = float
     help = Object update step size
-    doc = Divided by number_of_slices internally. With object_denom = 'local'
-          the preconditioner is the exact diagonal of A^dag A, so the per-slice
-          operator is the identity and the Jacobi bound is alpha < 2. Values
-          near 1 are safe and aggressive; 0.2 is roughly five times slower than
-          it needs to be.
+    doc = Divided by number_of_slices internally. Values near 1 are safe and
+          aggressive; 0.2 is roughly five times slower than it needs to be.
 
     [beta]
     default = 1.0
     type = float
     help = Probe update step size
     doc = Divided by number_of_slices internally, as for alpha.
-
-    [born_mode]
-    default = low_mem
-    type = str
-    help = How the Born sum is evaluated: 'parallel' or 'lowmem'
-    doc = 'parallel' pushes the whole slice stack through batched FFTs and
-          holds (N, batch, modes, ny, nx) workspaces -- fastest while it
-          fits. 'lowmem' loops over slices and keeps only (batch, modes,
-          ny, nx) workspaces, so the batch can grow by roughly a factor N
-          on the same GPU. Same arithmetic, same result.
-
-    [momentum]
-    default = 0.0
-    type = float
-    help = Heavy-ball momentum on the object update
-    doc = The increment is scaled by (1 - momentum) so the effective step
-          stays alpha/N and momentum can be changed without retuning alpha;
-          0 disables. Accelerates exactly the slow, low-spatial-frequency
-          directions that carry the depth information.
 
     [probe_update_interval]
     default = 1
@@ -312,46 +215,10 @@ class ISSTorch(ISSEngineInfra, stochastic.EPIE):
           probe converges long before the object, so 4 costs almost nothing in
           quality and saves close to 20 percent of the runtime.
 
-    [probe_converged_rtol]
-    default = 0.0
-    type = float
-    help = Freeze the probe once its per-iteration relative change drops below this
-    doc = Checked once per iteration as |P_new - P_old| / |P_old| over the whole
-          probe stack. Below the tolerance the probe update stops for good and
-          the unscattered illumination phi, which depends only on the probe, is
-          computed once and cached, saving both the probe-gradient transforms
-          and the per-batch phi FFTs for the rest of the run. 0 (the default)
-          disables the check and the probe is updated to the end: auto-freezing
-          could strand a probe that had only partially converged (e.g. a tight
-          high-NA probe still building structure), so it is opt-in.
-
-    [object_denom]
-    default = 'local'
-    type = str
-    help = Preconditioner: 'local' or 'max'
-    doc = 'local' uses the per-pixel accumulated denominator plus denom_reg
-          times its maximum, which is the exact diagonal of A^dag A. 'max' uses
-          the scalar maximum (ePIE convention); at batch_size > 1 that divides
-          everything by the most-overlapped pixel and starves sparsely covered
-          regions, so it is only for reproducing the CPU engine at batch_size 1.
-
-    [denom_reg]
-    default = 0.01
-    type = float
-    help = Floor on the 'local' denominator, as a fraction of its maximum
-
     [device]
     default = cuda
     type = str
     help = Torch device: 'cuda', 'cuda:0' or 'cpu'
-
-    [batch_size]
-    default = 1
-    type = int
-    help = Scan positions per object update
-    doc = Peak workspace scales as batch_size * probe_modes. Larger batches
-          use the FFT hardware better but give fewer updates per epoch;
-          32 to 128 is usually the sweet spot.
 
     [precision]
     default = single
@@ -386,31 +253,23 @@ class ISSTorch(ISSEngineInfra, stochastic.EPIE):
 
     def __init__(self, ptycho_parent, pars=None):
         super().__init__(ptycho_parent, pars)
-        self.ptycho.citations.add_article(
-            title="Ptychographic transmission microscopy in three dimensions using a multi-slice approach",
-            author="A. M. Maiden et al.",
-            journal="J. Opt. Soc. Am. A",
-            volume=29,
-            year=2012,
-            page=1606,
-            doi="10.1364/JOSAA.29.001606",
-            comment="The 3PIE reconstruction algorithm",
+        self.article = dict(
+            title='An inter-slice Born series for parallel-in-depth '
+                    'ptychography of thick samples',
+            author='B. Shirley et al.',
+            journal='in preparation',
+            volume=0,
+            year=2026,
+            page=0,
+            doi='',
+            comment='The inter-slice Born series reconstruction algorithm',
         )
-        self._stamp_plot_dir()
+        ptycho_parent.citations.add_article(**self.article)
 
     def engine_initialize(self):
         super().engine_initialize()
         self._setup_torch_infra()
         N = self.p.number_of_slices
-
-        # Probe-freeze machinery: once the probe's per-iteration relative
-        # change falls below probe_converged_rtol its updates stop and phi,
-        # the unscattered illumination (which depends only on the probe), is
-        # computed once into _phi_cache and reused every batch.
-        self._phi_cache = None
-        self._probe_frozen = False
-        self._pr_prev = None
-        self._probe_tol = float(self.p.probe_converged_rtol)
 
         # Persistent Gradient / Preconditioner Accumulators
         self._acc_grad = torch.zeros(
@@ -424,17 +283,6 @@ class ISSTorch(ISSEngineInfra, stochastic.EPIE):
         self._z0 = torch.zeros((), dtype=self.rdt, device=self.dev)
         self._nbatch = 0
         self._pint = max(1, int(self.p.probe_update_interval))
-        self._use_max = str(self.p.object_denom).lower().startswith("m")
-
-        self._core = (first_born_step_lowmem
-                      if str(self.p.born_mode).lower().startswith("l")
-                      else first_born_step)
-        self._mom = None
-        if float(self.p.momentum) > 0:
-            self._mom = torch.zeros_like(self.ob_g)
-        logger.info("born_mode = %s, momentum = %.3g"
-                    % (self._core.__name__.replace("first_born_step", "")
-                       .lstrip("_") or "parallel", float(self.p.momentum)))
 
         self._step = self._batch_update
 
@@ -471,8 +319,7 @@ class ISSTorch(ISSEngineInfra, stochastic.EPIE):
 
         self._nbatch += 1
         do_probe = (
-            not self._probe_frozen
-            and self.curiter >= self.p.probe_update_start
+            self.curiter >= self.p.probe_update_start
             and self._nbatch % self._pint == 0
         )
 
@@ -486,7 +333,7 @@ class ISSTorch(ISSEngineInfra, stochastic.EPIE):
         # =====================================================================
         # 2. RUN PURE MATHEMATICAL CORE
         # =====================================================================
-        grad_g, K_O, grad_P, K_P, r_field, I_mod = self._core(
+        grad_g, K_O, grad_P, K_P, r_field, I_mod = first_born_step(
             O=O_patches,
             P=self.pr_g,
             I_dat=I_dat,
@@ -496,7 +343,6 @@ class ISSTorch(ISSEngineInfra, stochastic.EPIE):
             ff_bw=backward_prop,
             mask=mask,
             calc_probe_grad=do_probe,
-            phi=self._phi_cache,
         )
 
         # =====================================================================
@@ -528,81 +374,21 @@ class ISSTorch(ISSEngineInfra, stochastic.EPIE):
 
         N = self.p.number_of_slices
         eps = torch.finfo(self.rdt).eps
-        reg = float(self.p.denom_reg)
-
-        # object_denom is honoured as given, at every batch size. ePIE at B=1
-        # conventionally divides by the MAX incident intensity, because the
-        # local denominator amplifies noise in dark regions; that is what
-        # object_denom='max' selects. Forcing it at B=1 regardless made
-        # object_denom='local' silently mean 'max' there, so a comparison of
-        # preconditioners at B=1 compared nothing. denom_reg floors the local
-        # denominator at a fraction of its own maximum, which is the intended
-        # guard against the dark-region blow-up.
-        use_max = self._use_max
 
         # --- Update Probe (if scheduled) ---
         if do_probe:
-            peak_P = K_P.amax()
-            dn_p = peak_P if use_max else K_P + (peak_P * reg)
+            dn_p = K_P.amax()
             self.pr_g.add_(grad_P / dn_p.clamp_min(eps), alpha=float(self.p.beta) / N)
             if self.pr_support is not None:
                 self.pr_g.mul_(self.pr_support)
 
         # --- Update Object Slices ---
-        peak_K = self._acc_K.amax(dim=(-2, -1), keepdim=True)
-        dn_o = peak_K if use_max else self._acc_K + (peak_K * reg)
+        dn_o = self._acc_K.amax(dim=(-2, -1), keepdim=True)
         upd = self._grad_to_param(self._acc_grad / dn_o.clamp_min(eps))
-        if self._mom is not None:
-            # heavy ball, scaled by (1 - mu) so the effective step stays
-            # alpha / N whatever the momentum
-            mu = float(self.p.momentum)
-            self._mom.mul_(mu).add_(upd, alpha=float(self.p.alpha) / N * (1.0 - mu))
-            self.ob_g += self._mom
-        else:
-            self.ob_g.add_(upd, alpha=float(self.p.alpha) / N)
-
-    def _freeze_probe(self, rel):
-        """Stop probe updates for good and pin the unscattered illumination."""
-        self._probe_frozen = True
-        self._pr_prev = None
-        P_f = torch.fft.fft2(self.pr_g).unsqueeze(0)
-        if self._core is first_born_step_lowmem:
-            self._phi_cache = torch.fft.ifft2(self.H_fwd[:, 0] * P_f)
-        else:
-            self._phi_cache = torch.fft.ifft2(self.H_fwd * P_f)
-        msg = (
-            f"probe converged at iteration {self.curiter}: relative change "
-            f"{rel:.3e} < {self._probe_tol:.3e}. Probe updates stopped and "
-            f"its illumination field is now cached."
-        )
-        logger.info(msg)
-        print(msg)
-
-    def _check_probe_converged(self):
-        """Once per iteration: freeze the probe when its update stalls."""
-        if (
-            self._probe_frozen
-            or self._probe_tol <= 0
-            or self.curiter <= self.p.probe_update_start
-        ):
-            return
-        if self._pr_prev is not None:
-            base = torch.linalg.vector_norm(self._pr_prev)
-            diff = torch.linalg.vector_norm(self.pr_g - self._pr_prev)
-            rel = float(diff / base.clamp_min(torch.finfo(self.rdt).eps))
-            msg = (
-                f"iteration {self.curiter}: probe relative change "
-                f"{rel:.3e} (freezes below {self._probe_tol:.3e})"
-            )
-            logger.info(msg)
-            print(msg)
-            if rel < self._probe_tol:
-                self._freeze_probe(rel)
-                return
-        self._pr_prev = self.pr_g.clone()
+        self.ob_g.add_(upd, alpha=float(self.p.alpha) / N)
 
     def engine_iterate(self, num=1):
-        B = int(self.p.batch_size)
+        B = 1
         for _ in range(num):
 
             if self.p.shuffle:
@@ -628,7 +414,6 @@ class ISSTorch(ISSEngineInfra, stochastic.EPIE):
             # reached numiter -- ThreePIETorch counts the other way round, so a
             # paired comparison was reading frames one iteration apart.
             self.curiter += 1
-            self._check_probe_converged()
             if self._plot_int > 0 and self.curiter % self._plot_int == 0:
                 self._plot_progress()
         return {"all": err}

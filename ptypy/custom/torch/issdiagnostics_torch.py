@@ -333,13 +333,6 @@ class ISSDiagnostics(TorchMixin, stochastic.EPIE):
           invariant and changes |g_j|. 'both' reports each, which is the honest
           thing to quote.
 
-    [batch_size]
-    default = 16
-    type = int
-    help = Scan positions per batch
-    doc = Peak workspace is (max_order + 3) x batch x probe_modes x frame, so
-          this is smaller than a reconstruction batch.
-
     [n_positions]
     default = None
     type = int
@@ -372,7 +365,7 @@ class ISSDiagnostics(TorchMixin, stochastic.EPIE):
     [benchmark_batch]
     default = None
     type = int
-    help = Positions per timed call; defaults to batch_size
+    help = Positions per timed call; defaults to 1
 
     [benchmark_reps]
     default = 5
@@ -1042,7 +1035,7 @@ class ISSDiagnostics(TorchMixin, stochastic.EPIE):
         # [blocks] parameter is accepted but ignored
         blocks = []
 
-        B = int(self.p.batch_size)
+        B = 1
         sel = np.arange(self.n_pos)
         if self.p.n_positions:
             sel = np.linspace(0, self.n_pos - 1, int(self.p.n_positions)).astype(int)
@@ -1598,7 +1591,7 @@ class ISSDiagnostics(TorchMixin, stochastic.EPIE):
             counts = [counts]
         counts = sorted({int(c) for c in counts if int(c) >= 1})
         reps = int(self.p.benchmark_reps)
-        B = int(self.p.benchmark_batch or self.p.batch_size)
+        B = int(self.p.benchmark_batch or 1)
         B = min(B, self.n_pos)
 
         idx = torch.arange(B, dtype=torch.long, device=self.dev)

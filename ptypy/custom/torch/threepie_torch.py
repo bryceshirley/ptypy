@@ -1,28 +1,14 @@
 """
-GPU-resident, batched multislice ePIE (3PIE) for ptypy, backed by PyTorch.
+GPU-resident multislice ePIE (3PIE) for ptypy, backed by PyTorch.
 
-    batch_size   = 1
-    shuffle      = False
-    object_denom = 'max'
+    shuffle = False
 
 it reproduces the CPU ThreePIE engine (ptypy stochastic.EPIE + multislice)
 update for update, up to floating point -- verified, see below.
 
-
-PRECONDITIONING THE SLICE UPDATES
----------------------------------
-`object_denom` selects what the slice increment is divided by.
-
-  'max'    ptypy's convention: the scalar max over the patch of
-           sum_m |psi^inc_i|^2, one number per view. This is what the CPU
-           engine does and it is the setting for reproducing it. At
-           batch_size > 1 it divides everything by the most strongly
-           illuminated pixel, so sparsely covered regions are starved.
-
-  'local'  the per-pixel accumulated denominator, sum over the batch of
-           sum_m |psi^inc_i|^2, with a floor of denom_reg times its maximum.
-           Numerator and denominator are accumulated separately over the batch
-           and divided once, which is the preconditioned mini-batch update.
+Each slice increment is divided by ptypy's convention: the scalar max over
+the patch of sum_m |psi^inc_i|^2, one number per view, which is what the
+CPU engine does.
 """
 
 
@@ -94,14 +80,6 @@ class ThreePIETorch(TorchMixin, stochastic.EPIE):
     doc = 'cuda', 'cuda:0', or 'cpu'. Falls back to cpu with a warning if CUDA
           is unavailable.
 
-    [batch_size]
-    default = 1
-    type = int
-    help = Number of scan positions per update
-    doc = 1 reproduces sequential 3PIE exactly. Larger values are faster but
-          average the per-view increments instead of applying them in sequence.
-          16-64 is usually a good trade for 512x512 frames.
-
     [precision]
     default = single
     type = str
@@ -120,28 +98,6 @@ class ThreePIETorch(TorchMixin, stochastic.EPIE):
     type = float, NoneType
     help = Override for the illumination update step size
     doc = None inherits ptypy's value, which for EPIE is p.alpha.
-
-    [object_denom]
-    default = max
-    type = str
-    help = Slice preconditioner: 'max', 'local' or 'unscattered'
-    doc = 'max' is ptypy's scalar max over the patch of sum_m |psi^inc_i|^2 and
-          reproduces the CPU engine. 'local' is the per-pixel accumulated
-          denominator, numerator and denominator summed over the batch and
-          divided once: the preconditioned mini-batch update, and the setting
-          to use above batch_size = 1. 'unscattered' divides by sum_m |phi_i|^2
-          with phi_i the probe propagated to slice i with no object in the way,
-          which is the ISS engine's denominator; use it in both engines
-          when comparing the two forward models, so that the comparison is not
-          confounded by the preconditioner.
-
-    [denom_reg]
-    default = 0.1
-    type = float
-    help = Floor on the 'local' and 'unscattered' denominators, as a fraction of the maximum
-    doc = Ignored for 'max', which needs no regularisation. A focused probe has
-          compact support and interior zeros, so the local denominator must be
-          floored somewhere.
 
     [obj_smooth_std]
     default = None
@@ -257,37 +213,11 @@ class ThreePIETorch(TorchMixin, stochastic.EPIE):
         )
         logger.info(f"object step {self.ob_step:.4g}, probe step {self.pr_step:.4g}")
 
-        # ---- preconditioner (D1) ----
-        self._denom = str(self.p.object_denom).lower()
-        if self._denom not in ("max", "local", "unscattered"):
-            raise ValueError("object_denom must be 'max', 'local' or 'unscattered'")
-        self._reg = float(self.p.denom_reg)
-        logger.info(
-            "slice preconditioner: {}{}".format(
-                self._denom,
-                ""
-                if self._denom == "max"
-                else f", floor {self._reg:.3g} of the maximum",
-            )
-        )
-        if self._denom == "max" and int(self.p.batch_size) > 1:
-            logger.warning(
-                f"object_denom='max' at batch_size={int(self.p.batch_size)} divides "
-                "every slice increment by the most strongly illuminated pixel in the "
-                "batch, which starves sparsely covered regions. Use 'local'."
-            )
-
         # ptypy's global object norm would need the product-of-slices object,
         # which is a different quantity per slice. Refuse rather than guess.
         if getattr(self, "_object_norm_is_global", False):
             raise NotImplementedError(
                 "object_norm_is_global is not supported by ThreePIETorch; set it False"
-            )
-
-        if int(self.p.batch_size) > 1:
-            logger.warning(
-                f"batch_size={int(self.p.batch_size)}: per-view increments are averaged, "
-                "not applied sequentially. Use batch_size=1 for exact 3PIE."
             )
 
         # ---- slice_start_iteration ----
@@ -341,10 +271,6 @@ class ThreePIETorch(TorchMixin, stochastic.EPIE):
 
         # ---- circular probe support (D8; default None keeps CPU parity) ----
         self._setup_probe_support()
-
-        # sum_m |phi_i|^2 for object_denom='unscattered'; rebuilt whenever the
-        # probe moves
-        self._phi_cache = None
 
         # ---- object regularisation ----
         self._smooth_std = (
@@ -467,20 +393,6 @@ class ThreePIETorch(TorchMixin, stochastic.EPIE):
         self._ff_fw_g = to_g(self._ff_fw)
         self._ff_bw_g = to_g(self._ff_bw)
 
-    def _unscattered(self):
-        """sum_m |phi_i|^2, the ISS denominator: the probe propagated to
-        each slice with no object in the way. Cached until the probe moves."""
-        if self._phi_cache is None:
-            N = int(self.p.number_of_slices)
-            ph = torch.empty(
-                (N, self.M, self.fny, self.fnx), dtype=self.cdt, device=self.dev
-            )
-            ph[0] = self.pr_g
-            for i in range(1, N):
-                ph[i] = self._apply(self._fw_g[i - 1], ph[i - 1])
-            self._phi_cache = (ph.abs() ** 2).sum(dim=1)  # (N, ny, nx)
-        return self._phi_cache
-
     def _collect_views(self):
         """Pull positions, intensities and masks onto the GPU once."""
         names = sorted([n for n, v in self.di.views.items() if v.active])
@@ -561,9 +473,9 @@ class ThreePIETorch(TorchMixin, stochastic.EPIE):
         cov = torch.zeros(self.ob_g.shape[-2:], dtype=self.rdt, device=self.dev)
         w = (self.pr_g.abs() ** 2).sum(0)  # over probe modes -> (fny, fnx)
         # _scatter_add materialises B*fny*fnx int64 indices twice, so this walks
-        # in update-sized chunks rather than one pass: at 512x512 frames a batch
+        # in small chunks rather than one pass: at 512x512 frames a chunk
         # of 256 would ask for a gigabyte of indices to build a 6 MB map.
-        step = max(1, int(self.p.batch_size))
+        step = 1
         for s in range(0, self.n_pos, step):
             idx = torch.arange(
                 s, min(s + step, self.n_pos), device=self.dev, dtype=torch.long
@@ -618,7 +530,7 @@ class ThreePIETorch(TorchMixin, stochastic.EPIE):
     #  Main loop                                                          #
     # ------------------------------------------------------------------ #
     def engine_iterate(self, num=1):
-        B = int(self.p.batch_size)
+        B = 1
 
         for _ in range(num):
 
@@ -657,7 +569,6 @@ class ThreePIETorch(TorchMixin, stochastic.EPIE):
         B = idx.numel()
         M = self.M
         eps = torch.finfo(self.rdt).eps
-        use_max = self._denom == "max"
 
         active = [self.curiter >= self.p.slice_start_iteration[i] for i in range(N)]
         # D4: probe_update_start freezes the probe, i.e. psi_0. It does NOT
@@ -714,11 +625,8 @@ class ThreePIETorch(TorchMixin, stochastic.EPIE):
             err_phot = torch.zeros_like(err_fmag)
 
         # ---------------- backward ----------------
-        # 'max': the per-view increment is normalised exactly as ptypy does and
-        #        the increments are averaged over the batch.
-        # 'local' / 'unscattered': numerator and denominator are accumulated
-        #        separately over the batch and divided once, which is the
-        #        preconditioned mini-batch update.
+        # The per-view increment is normalised exactly as ptypy does and the
+        # increments are averaged over the batch.
         num_o = [torch.zeros_like(self.ob_g[0]) for _ in range(N)]
         den_o = [
             torch.zeros(self.ob_g[0].shape, dtype=self.rdt, device=self.dev)
@@ -727,10 +635,8 @@ class ThreePIETorch(TorchMixin, stochastic.EPIE):
         ones_patch = torch.ones(
             (B, self.fny, self.fnx), dtype=self.rdt, device=self.dev
         )
-        phi2 = self._unscattered() if self._denom == "unscattered" else None
 
         num_pr = torch.zeros_like(self.pr_g)
-        den_pr = torch.zeros((self.fny, self.fnx), dtype=self.rdt, device=self.dev)
         pr_replace = None
 
         target = e_proj
@@ -740,29 +646,13 @@ class ThreePIETorch(TorchMixin, stochastic.EPIE):
             if active[i]:
                 # local intensity of the field incident on this slice: the
                 # multislice analogue of |phi_i|^2, carrying every slice above
-                if phi2 is None:
-                    w = (psis[i].abs() ** 2).sum(dim=1)  # (B, ny, nx)
-                else:
-                    w = phi2[i].expand(B, self.fny, self.fnx)
+                w = (psis[i].abs() ** 2).sum(dim=1)  # (B, ny, nx)
                 grad = (psis[i].conj() * delta).sum(dim=1)  # (B, ny, nx)
 
-                if use_max:
-                    pn = w.amax(dim=(-2, -1))[:, None, None]
-                    dob = self.ob_step * grad / pn.clamp_min(eps).to(self.cdt)
-                    self._scatter_add(num_o[i], idx, dob)
-                    self._scatter_add(den_o[i], idx, ones_patch)
-                else:
-                    self._scatter_add(num_o[i], idx, grad)
-                    self._scatter_add(den_o[i], idx, w)
-                    # per-view estimate of the same update, for the psi
-                    # correction below; identical to the batch update at B = 1
-                    dob = (
-                        self.ob_step
-                        * grad
-                        / (w + self._reg * w.amax(dim=(-2, -1))[:, None, None])
-                        .clamp_min(eps)
-                        .to(self.cdt)
-                    )
+                pn = w.amax(dim=(-2, -1))[:, None, None]
+                dob = self.ob_step * grad / pn.clamp_min(eps).to(self.cdt)
+                self._scatter_add(num_o[i], idx, dob)
+                self._scatter_add(den_o[i], idx, ones_patch)
 
                 # --- illumination update (D2, D5): uses the UPDATED object
                 o_new = ob_p[i] + dob  # (B, ny, nx)
@@ -780,31 +670,17 @@ class ThreePIETorch(TorchMixin, stochastic.EPIE):
                 # not small. Gating only at i == 0 still freezes the probe,
                 # because psi_0 is where the probe increment comes from.
                 if do_pr or i > 0:
-                    if use_max:
-                        on = (M * o_new.abs() ** 2).amax(dim=(-2, -1))[
-                            :, None, None, None
-                        ]
-                        dpsi = (
-                            self.pr_step
-                            * o_new.conj()[:, None]
-                            * delta
-                            / on.clamp_min(eps).to(self.cdt)
-                        )
-                        if i == 0:
-                            num_pr = num_pr + dpsi.sum(dim=0)
-                    else:
-                        ow = M * o_new.abs() ** 2  # (B, ny, nx)
-                        dpsi = (
-                            self.pr_step
-                            * o_new.conj()[:, None]
-                            * delta
-                            / (ow + self._reg * ow.amax(dim=(-2, -1))[:, None, None])
-                            .clamp_min(eps)[:, None]
-                            .to(self.cdt)
-                        )
-                        if i == 0:
-                            num_pr = num_pr + (o_new.conj()[:, None] * delta).sum(dim=0)
-                            den_pr = den_pr + ow.sum(dim=0)
+                    on = (M * o_new.abs() ** 2).amax(dim=(-2, -1))[
+                        :, None, None, None
+                    ]
+                    dpsi = (
+                        self.pr_step
+                        * o_new.conj()[:, None]
+                        * delta
+                        / on.clamp_min(eps).to(self.cdt)
+                    )
+                    if i == 0:
+                        num_pr = num_pr + dpsi.sum(dim=0)
                     psi_new = psis[i] + dpsi
                 else:
                     psi_new = psis[i]
@@ -821,26 +697,15 @@ class ThreePIETorch(TorchMixin, stochastic.EPIE):
         for i in range(N):
             if not active[i]:
                 continue
-            if use_max:
-                self.ob_g[i] += num_o[i] / den_o[i].clamp_min(1.0).to(self.cdt)
-            else:
-                dn = den_o[i] + self._reg * den_o[i].amax()
-                self.ob_g[i] += self.ob_step * num_o[i] / dn.clamp_min(eps).to(self.cdt)
+            self.ob_g[i] += num_o[i] / den_o[i].clamp_min(1.0).to(self.cdt)
 
         if pr_replace is not None:
             self.pr_g = pr_replace.to(self.cdt)
-            self._phi_cache = None
         elif do_pr:
-            if use_max:
-                self.pr_g += num_pr / float(B)
-            else:
-                dn = den_pr + self._reg * den_pr.amax()
-                self.pr_g += self.pr_step * num_pr / dn.clamp_min(eps).to(self.cdt)
-            self._phi_cache = None
+            self.pr_g += num_pr / float(B)
 
         if self.pr_support is not None:
             self.pr_g = self.pr_g * self.pr_support
-            self._phi_cache = None
 
         # ---------------- pack per-view errors ----------------
         ii = idx.detach().cpu().numpy()
@@ -875,11 +740,8 @@ class ThreePIETorch(TorchMixin, stochastic.EPIE):
         slices_info.number_of_slices = self.p.number_of_slices
         slices_info.slice_thickness = self.p.slice_thickness
         slices_info.slice_start_iteration = self.p.slice_start_iteration
-        slices_info.batch_size = self.p.batch_size
         slices_info.object_step = self.ob_step
         slices_info.probe_step = self.pr_step
-        slices_info.object_denom = self._denom
-        slices_info.denom_reg = self._reg
         slices_info.seed = int(self.p.seed)
 
         slices_info.objects = {

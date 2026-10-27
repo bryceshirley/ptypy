@@ -1234,7 +1234,6 @@ class ISSEngineInfra(TorchMixin):
         info = Param(
             number_of_slices=self.p.number_of_slices,
             slice_thickness=self.p.slice_thickness,
-            batch_size=self.p.get("batch_size", None),
             alpha=self.p.get("alpha", None),
             objects={
                 ob.ID: {ID: S._to_dict() for ID, S in ob.storages.items()}

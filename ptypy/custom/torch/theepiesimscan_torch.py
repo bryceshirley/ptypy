@@ -573,7 +573,7 @@ class MultisliceSimulator(issdiagnostics_torch.ISSDiagnostics):
         Returns the intensity frames as float64 numpy (n_pos, ny, nx) plus
         the summary statistics against the measured data.
         """
-        B = int(self.p.batch_size)
+        B = 1
         I_sim = np.empty((self.n_pos, self.fny, self.fnx), dtype=np.float64)
         corr, ratio = [], []
         with torch.no_grad():

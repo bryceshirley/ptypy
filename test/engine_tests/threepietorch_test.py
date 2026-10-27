@@ -204,9 +204,8 @@ class _ParityFixture(unittest.TestCase):
 
     def torch_engine(self, P, **kw):
         p = u.Param(name="ThreePIETorch", fslices=self.outpath + "/t.h5",
-                    device="cpu", precision="double", batch_size=1,
-                    shuffle=False, seed=0, plot_interval=0,
-                    object_denom="max", **kw)
+                    device="cpu", precision="double",
+                    shuffle=False, seed=0, plot_interval=0, **kw)
         eng = ThreePIETorch(P, p)
         eng.initialize()
         eng.prepare()
@@ -847,8 +846,8 @@ class EndToEndTest(unittest.TestCase):
                 cls.SORTED: cls._run(cls.SORTED),
                 cls.TORCH: cls._run(cls.TORCH,
                                     dict(device="cpu", precision="single",
-                                         batch_size=1, shuffle=False, seed=0,
-                                         plot_interval=0, object_denom="max")),
+                                         shuffle=False, seed=0,
+                                         plot_interval=0)),
                 cls.STOCK: cls._run(cls.STOCK),
             }
         finally:
