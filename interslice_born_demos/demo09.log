@@ -1,0 +1,15 @@
+32 slices x 0.05 rad (1.6 rad total): truncation error of the ground truth
+  eps_0 = 1.540e-02
+  eps_1 = 1.332e-05
+  eps_2 = 4.556e-10
+  eps_3 = 1.137e-14
+  eps_4 = 6.291e-15
+  eps_5 = 6.291e-15
+  eps_6 = 6.291e-15
+reconstructing at order M = 1 ...
+reconstructing at order M = 2 ...
+reconstructing at order M = 4 ...
+wrote demo_out/demo_09_thick_weak_orders.png
+wrote demo_out/demo_09_thick_weak_recon.png
+final (error, projected-phase corr vs truth): {1: (3.55e-09, 0.979), 2: (3.49e-09, 0.979), 4: (3.49e-09, 0.979)}
+order-vs-order agreement (corr with M = 4): {1: 0.99999, 2: 1.0} -- every order fits the data to round-off and lands on the SAME object; the residual difference from the truth is the weak-contrast null space of the data (low spatial frequencies of the projected phase), identical at every order -- the discarded orders are invisible here, which is the point

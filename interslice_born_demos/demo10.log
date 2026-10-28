@@ -1,0 +1,8 @@
+==== This reconstruction relied on the following work ==========================
+The Ptypy framework:
+    Enders B. and Thibault P., "A computational framework for ptychographic reconstructions" Proc. Royal Soc. A 472 (2016) 20160640, doi: 10.1098/rspa.2016.0640.
+The ePIE reconstruction algorithm:
+    Maiden A. and Rodenburg J., "An improved ptychographical phase retrieval algorithm for diffractive imaging" Ultramicroscopy 10 (2009) 1256, doi: 10.1016/j.ultramic.2009.05.012.
+The inter-slice Born series reconstruction algorithm:
+    B. Shirley et al., "An inter-slice Born series for parallel-in-depth ptychography of thick samples" in preparation 0 (2026) 0, doi: .
+================================================================================

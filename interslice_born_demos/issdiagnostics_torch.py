@@ -87,7 +87,7 @@ import numpy as np
 from matplotlib import pyplot as plt
 from matplotlib.colors import LogNorm
 
-from ptypy.custom.torch.base_torch import TorchMixin
+from ptypy.custom.interslice_born.base import TorchISBEngineInfra as TorchMixin
 from ptypy.engines import stochastic
 from ptypy.engines import register
 from ptypy.utils import Param

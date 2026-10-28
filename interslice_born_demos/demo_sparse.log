@@ -1,0 +1,11 @@
+ground truth: /home/dnz75396/ptypy/data/nanomax/process/0002_multislice/scan_000434/ptycho_ptypy_crop_512_detdist_4.18_slice_0.00158/sim/sim_20260913_203229_slices-3_seed-7/sim_20260913_203229_slices-3_seed-7_truth_iter-0000.h5
+probe: (2, 512, 512) from rec_sim_20260913_203229_slices-3_seed-7_fast-fast30fp_FastFirstBornTorch_0030.ptyr
+16 positions; layers per beam cone: max 1 (disjoint -- chord order 1 is exact)
+eps_M (chord) over the demo positions: [2.985e-01 9.371e-16 9.371e-16 9.371e-16]
+eps_1 (tangent): 0.44
+stored ISSDiagnostics (diag/results.json, full scan): eps_order {'0': 0.148, '1': 0.000785, '2': 1.06e-06, '3': 4.24e-16} eps_linearised 0.212
+wrote demo_out/sparse_forward_frames.png
+reconstructing (chord)...
+reconstructing (tangent)...
+wrote demo_out/sparse_chord_vs_tangent_recon.png
+final errors: chord 0.388, tangent 3.85

@@ -1,5 +1,5 @@
 """
-Reference ISSTorch reconstruction of NanoMAX scan 434 for benchmarking the
+Reference order-1 ISB (first Born) reconstruction of NanoMAX scan 434 for benchmarking the
 cupy ePIE_ISB_cupy engine against it. Same prepared .ptyd, same illumination.
 plot_interval=0 (this branch has no torch_helpers); the probe/object are read
 from the saved fslices/ptyr and plotted separately.
@@ -11,7 +11,7 @@ import ptypy
 from ptypy.core import Ptycho
 from ptypy import utils as u
 
-import ptypy.custom.torch.iss_torch   # registers ISSTorch
+import ptypy.custom.interslice_born.isb_torch   # registers ISBTorch
 
 PTYD = ('/home/dnz75396/ptypy/data/nanomax/process/0002_multislice/'
         'scan_000434/ptycho_ptypy_crop_512_detdist_4.18_slice_0.00158/'
@@ -21,7 +21,7 @@ numiter = int(sys.argv[1]) if len(sys.argv) > 1 else 20
 batch   = int(sys.argv[2]) if len(sys.argv) > 2 else 512
 
 out = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                   'runs', 'nanomax434_ISSTorch_it%d_b%d' % (numiter, batch))
+                   'runs', 'nanomax434_ISBTorch_o1_it%d_b%d' % (numiter, batch))
 os.makedirs(out, exist_ok=True)
 import shutil as _shutil
 _shutil.copy(os.path.abspath(__file__),
@@ -60,7 +60,8 @@ p.scans.scan00.illumination.diversity.noise = (0.5, 1.0)
 
 p.engines = u.Param()
 p.engines.engine00 = u.Param()
-p.engines.engine00.name = 'ISSTorch'
+p.engines.engine00.name = 'ISBTorch'
+p.engines.engine00.order = 1
 p.engines.engine00.numiter = numiter
 p.engines.engine00.numiter_contiguous = 1
 p.engines.engine00.probe_support = 0.3
@@ -68,9 +69,7 @@ p.engines.engine00.number_of_slices = 2
 p.engines.engine00.slice_thickness = 1580.e-6
 p.engines.engine00.alpha = 1.0
 p.engines.engine00.beta = 1.0
-p.engines.engine00.object_denom = 'local'
 p.engines.engine00.probe_update_interval = 1
-p.engines.engine00.batch_size = batch
 p.engines.engine00.shuffle = False
 p.engines.engine00.plot_interval = 0
 p.engines.engine00.seed = 0
@@ -79,4 +78,4 @@ p.engines.engine00.fslices = os.path.join(out, 'slices_issref.h5')
 
 t0 = time.time()
 P = Ptycho(p, level=5)
-print('== ISSTorch done: %d iters in %.1f s' % (numiter, time.time() - t0))
+print('== ISBTorch(order=1) done: %d iters in %.1f s' % (numiter, time.time() - t0))

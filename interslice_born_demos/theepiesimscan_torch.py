@@ -63,8 +63,8 @@ from matplotlib.colors import LogNorm
 from ptypy.engines import register
 from ptypy.utils.verbose import logger
 
-from .. import issdiagnostics_torch
-from .issdiagnostics_torch import _jsonable
+import issdiagnostics_torch
+from issdiagnostics_torch import _jsonable
 
 try:
     import torch
