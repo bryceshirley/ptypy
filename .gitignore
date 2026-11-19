@@ -31,3 +31,5 @@ ghostdriver*
 pip-wheel-metadata/
 .venv/
 docs/_build
+data/
+results/

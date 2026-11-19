@@ -40,4 +40,5 @@ Additional (custom) Engines
    ptypy.custom.WASP
    ptypy.custom.ePIE_parallel
    ptypy.custom.threepie
+   ptypy.custom.intersliceborn
  
