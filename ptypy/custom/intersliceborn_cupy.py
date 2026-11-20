@@ -555,3 +555,143 @@ class IntersliceBornLinearised(IntersliceBorn):
         self.ob_g = cp.exp(1j * self.ob_g)
         self._bind_store()
         return super().engine_finalize()
+
+
+@register()
+class IntersliceFirstBornLineSearch(IntersliceBorn):
+    """
+    Inter-slice first Born with a line search on the step size.
+
+    The order-1 model is affine in each unknown, so substituting an update
+    along a search direction makes the detector field affine in the step
+    size, psi(g) = psi + g*dpsi. The model intensity is then exactly
+    quadratic in g and the intensity Gaussian likelihood is a quartic,
+    whose minimiser is a real root of the derivative cubic. That root is
+    the exact minimiser along the direction, found with one extra forward
+    evaluation and no tuned step size.
+
+    Object and probe are searched separately, as a block coordinate
+    descent. Keeping them separate is what holds the likelihood at degree
+    four: a common step would make the field quadratic in the step size
+    and the likelihood degree eight. The object step is taken first, after
+    which the updated detector field is known in closed form, so the probe
+    step is evaluated against the updated object. The probe direction is
+    the one computed before the object update, which avoids a second
+    backward pass; it is no longer exactly the gradient there, but the
+    search still finds the best step along it, which may be negative.
+
+    Because the search rescales the whole direction, any common factor is
+    absorbed into the step. The slice preconditioners therefore only set
+    the relative weighting between slices, and the probe preconditioner
+    has no effect at all. The inherited alpha and beta step sizes play no
+    part: the step is what the line search returns.
+
+    The series is affine in the step size only at order 1; at order M the
+    field is a polynomial of degree M. The order is therefore not a
+    parameter of this engine, it is set to 1.
+
+    Defaults:
+
+    [name]
+    default = IntersliceFirstBornLineSearch
+    type = str
+    help = Engine identifier
+
+    [fidelity]
+    default = amplitude
+    type = str
+    help = Functional the step size minimises: 'gaussian' or 'amplitude'
+    doc = 'gaussian' is the intensity Gaussian likelihood, weighted by
+          w/(I + 1) as in ptypy's Gaussian model, for which the step is
+          the exact minimiser along the direction. 'amplitude' is the
+          amplitude-l2 fidelity the search directions themselves come
+          from; it has no closed-form minimiser, so a single Newton step
+          is taken, exact in its second-order expansion.
+
+    [wavefield_delta_object]
+    default = 0.1
+    type = float
+    help = Wavefield preconditioner damping constant for the object.
+
+    [wavefield_delta_probe]
+    default = 0.1
+    type = float
+    help = Wavefield preconditioner damping constant for the probe.
+    """
+
+    FIDELITIES = ("gaussian", "amplitude")
+
+    def engine_initialize(self):
+        # Not a parameter of this engine: only order 1 makes the model
+        # affine in the object step, which is what the line search needs.
+        self.p.order = 1
+        super().engine_initialize()
+        self._fidelity = str(self.p.fidelity or "gaussian").lower()
+        if self._fidelity not in self.FIDELITIES:
+            raise ValueError("fidelity must be one of %s, got %r"
+                             % (sorted(self.FIDELITIES), self.p.fidelity))
+        logger.info("line search: exact quartic on the intensity Gaussian "
+                    "likelihood" if self._fidelity == "gaussian" else
+                    "line search: Newton step on the amplitude-l2 fidelity")
+
+    def _step(self, weight, mask):
+        """Step size along the direction whose detector field is in Dd."""
+        st = self._raw_step
+        if self._fidelity == "gaussian":
+            return st.line_search_gaussian(weight)
+        return st.line_search_newton(mask)
+
+    def _update_view(self, pos, do_probe):
+        """
+        One scan position: the same gradients as the parent engine, but
+        the scalar step along each is found by a line search instead of
+        being fixed. Device work only.
+        """
+        N = int(self.p.number_of_slices)
+        flat = self._flat(pos)
+
+        O_patches = cp.stack([
+            self.ob_g[j].reshape(-1)[flat].reshape(self.fny, self.fnx)
+            for j in range(N)
+        ])
+        self._update_gauge(O_patches)
+        amp_dat = self.amp_dat[pos]
+        mask = (None if self.maskb is None
+                else self.maskb[pos].astype(cp.float32))
+
+        st = self._raw_step
+        st.O[...] = self._model_object(O_patches)
+        st.Idat[...] = amp_dat ** 2
+        if mask is not None:
+            st.mask[...] = mask
+        st.g2[0] = (1.0 if self._gauge is None
+                    else cp.abs(self._gauge) ** 2)
+        st.run()
+
+        self._accumulate_error(amp_dat, mask)
+
+        # ptypy's Gaussian weighting: the Poisson variance offset by one
+        # count, so empty pixels keep a finite weight
+        w = 1.0 if mask is None else mask
+        weight = w / (st.Idat + 1.0)
+
+        # object: the preconditioned gradient sets the direction, the
+        # line search sets how far along it to go
+        dn_o = st.K.max(axis=(-2, -1), keepdims=True)
+        d = st.grad / (dn_o + float(self.p.wavefield_delta_object))
+        st.direction_object(d)
+        gamma = self._step(weight, w)
+        st.advance(gamma, d)
+        # d is a direction in the model perturbation; the stored
+        # parameter is the object itself, so undo the centring
+        upd = self._grad_to_param(d if self._bg is None else d * self._bg)
+        for j in range(N):
+            self.ob_g[j].reshape(-1)[flat] += (gamma * upd[j]).ravel()
+
+        if do_probe:
+            d_P = st.gP / (st.KP.max() + float(self.p.wavefield_delta_probe))
+            st.direction_probe(d_P)
+            beta = self._step(weight, w)
+            self.pr_g += beta * d_P
+            if self.pr_support is not None:
+                self.pr_g *= self.pr_support

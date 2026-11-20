@@ -49,8 +49,10 @@ def slice_bandlimit(shape, resolution, energy, distance):
     """Angular-spectrum support mask for alias-free multislice propagation."""
     nrows, ncols = shape[-2:]
     dy, dx = resolution
-    wavelength = geometry.Geo._keV2m / float(energy)
-    distance = abs(float(distance))
+    # geo.energy can arrive as a size-1 array (PtydScan stores it per
+    # scan); NumPy 2 no longer coerces those with float()
+    wavelength = geometry.Geo._keV2m / float(np.asarray(energy).ravel()[0])
+    distance = abs(float(np.asarray(distance).ravel()[0]))
     if distance == 0.0:
         return np.ones((nrows, ncols), dtype=np.complex64)
     vlim_y = 1.0 / np.sqrt((2.0 * distance / (nrows * dy)) ** 2 + 1.0)

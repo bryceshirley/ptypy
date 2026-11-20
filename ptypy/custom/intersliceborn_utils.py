@@ -153,12 +153,55 @@ __global__ void kp_kernel(const cf* O, float* KP, int N, int P) {
     KP[p] = a;
 }
 
+
+// Minimiser of the quartic A0 + A1 g + A2 g^2 + A3 g^3 + A4 g^4 along the
+// search line. The stationary points are the real roots of the derivative
+// cubic; the quartic is evaluated at each and the lowest is taken. A4 > 0
+// whenever the direction reaches the detector, so a global minimum exists.
+__device__ double ls_quartic(const double* A, double g) {
+    return A[0] + g*(A[1] + g*(A[2] + g*(A[3] + g*A[4])));
+}
+
+__global__ void ls_gamma(const double* A, float* out) {
+    if (threadIdx.x || blockIdx.x) return;
+    double a3 = 4.0*A[4], a2 = 3.0*A[3], a1 = 2.0*A[2], a0 = A[1];
+    if (fabs(a3) < 1e-30) {                 // degenerate: Newton on the
+        out[0] = (fabs(a1) > 1e-30) ? (float)(-a0/a1) : 0.f;   // quadratic
+        return;
+    }
+    double a = a2/a3, b = a1/a3, c = a0/a3;
+    double p = b - a*a/3.0;
+    double q = 2.0*a*a*a/27.0 - a*b/3.0 + c;
+    double disc = q*q/4.0 + p*p*p/27.0;
+    double roots[3];
+    int nr;
+    if (disc > 0.0) {                       // one real root
+        double s = sqrt(disc);
+        roots[0] = cbrt(-q/2.0 + s) + cbrt(-q/2.0 - s) - a/3.0;
+        nr = 1;
+    } else {                                // three real roots
+        double m = 2.0*sqrt(fmax(-p/3.0, 0.0));
+        double arg = (m > 1e-300) ? 3.0*q/(p*m) : 0.0;
+        arg = fmin(1.0, fmax(-1.0, arg));
+        double th = acos(arg)/3.0;
+        for (int k = 0; k < 3; ++k)
+            roots[k] = m*cos(th - 2.0943951023931953*k) - a/3.0;
+        nr = 3;
+    }
+    double best = 0.0, bestv = 1e300;
+    for (int k = 0; k < nr; ++k) {
+        double v = ls_quartic(A, roots[k]);
+        if (v < bestv) { bestv = v; best = roots[k]; }
+    }
+    out[0] = (float)best;
+}
+
 }  // extern C
 """
 
 _NAMES = ("scatter", "scatter_conj", "cumsum_fwd", "cumsum_rev", "detector",
           "pair_accum", "winc_accum", "probe_grad", "kp_kernel", "mult",
-          "mult_conj")
+          "mult_conj", "ls_gamma")
 _TPB = 256
 _kernels = None
 
@@ -257,6 +300,13 @@ class BornCudaStep:
         self.Imod = cp.zeros((nd, nd), dtype=cp.float32)
         self.K = cp.zeros((N, nd, nd), dtype=cp.float32)
         self.KP = cp.zeros((nd, nd), dtype=cp.float32)
+        # line search: the detector-frame spectrum of the current model
+        # and of a search direction, plus the quartic and its minimiser
+        self.Odir = cp.ones((N, n, n), dtype=cdt)
+        self.Dfld = z(Mp, nd, nd)
+        self.Dd = z(Mp, nd, nd)
+        self.A = cp.zeros((5,), dtype=cp.float64)
+        self.gamma = cp.zeros((1,), dtype=cp.float32)
 
         # one plan per array shape the transforms run on
         self.plan_grid = get_fft_plan(self.P_f, axes=(-2, -1))    # Mp,n,n
@@ -272,6 +322,52 @@ class BornCudaStep:
         with plan:
             out[...] = (ifft2(x, axes=(-2, -1), norm="backward") if inverse
                         else fft2(x, axes=(-2, -1), norm="backward"))
+
+    def _forward(self, O, Pr, incident=True):
+        """Order-M forward model into self.total. incident=False drops the
+        unscattered term, which is what a search direction needs."""
+        N, M, Mp, Pix = self.N, self.M, self.Mp, self.Pix
+        MP, NMP = self.MP, self.N * self.MP
+        self._fft(self.plan_grid, Pr, self.P_f)
+        self.buf[...] = self.Hf[:, None] * self.P_f[None]
+        self._fft(self.plan_slices, self.buf, self.cur[0], inverse=True)
+        if incident:
+            self.total[...] = self.P_f
+        else:
+            self.total.fill(0)
+        for m in range(1, M + 1):
+            self._launch("scatter", NMP, O, self.cur[m - 1], self.s,
+                         NMP, MP, Pix)
+            self._fft(self.plan_slices, self.s, self.buf)
+            self._launch("cumsum_fwd", MP, self.buf, self.Hf, self.Hr,
+                         self.s, self.total, N, Mp, Pix)
+            if m < M:
+                self._fft(self.plan_slices, self.s, self.cur[m], inverse=True)
+
+    def _detector_spectrum(self, out):
+        """Entrance-referred self.total to the detector-frame spectrum.
+        The model intensity is g2/Pd times its squared modulus, summed
+        over probe modes."""
+        pad, ctr, Pd = self.padded, self.ctr, self.Pd
+        if pad:
+            # carry to the exit plane before cropping: a crop does not
+            # commute with propagation
+            self.psi[...] = self.Hlast * self.total
+            self._fft(self.plan_grid, self.psi, self.Rf, inverse=True)
+            self.e1[...] = self.Rf[ctr]
+            if self.pre is None:
+                self._fft(self.plan_frame, self.e1, out)
+            else:
+                self._launch("mult", self.MPd, self.pre, self.e1,
+                             self.e2, self.MPd, Pd)
+                self._fft(self.plan_frame, self.e2, out)
+        elif self.pre is None:
+            out[...] = self.total
+        else:
+            self._fft(self.plan_grid, self.total, self.e1, inverse=True)
+            self._launch("mult", self.MP, self.pre, self.e1, self.e2,
+                         self.MP, self.Pix)
+            self._fft(self.plan_grid, self.e2, out)
 
     def run(self):
         N, M, Mp = self.N, self.M, self.Mp
@@ -290,66 +386,29 @@ class BornCudaStep:
         else:
             O, Pr = self.O, self.Pr
 
-        # unscattered field and readout accumulator
-        self._fft(self.plan_grid, Pr, self.P_f)
-        self.buf[...] = self.Hf[:, None] * self.P_f[None]
-        self._fft(self.plan_slices, self.buf, self.cur[0], inverse=True)
-        self.total[...] = self.P_f
-
-        # forward orders
-        for m in range(1, M + 1):
-            self._launch("scatter", NMP, O, self.cur[m - 1], self.s,
-                         NMP, MP, Pix)
-            self._fft(self.plan_slices, self.s, self.buf)
-            self._launch("cumsum_fwd", MP, self.buf, self.Hf, self.Hr,
-                         self.s, self.total, N, Mp, Pix)
-            if m < M:
-                self._fft(self.plan_slices, self.s, self.cur[m], inverse=True)
+        self._forward(O, Pr, incident=True)
 
         # detector
+        self._detector_spectrum(self.Dfld)
+        self._launch("detector", Pd, self.Dfld, self.Idat, self.Imod,
+                     self.e2, Mp, Pd, np.float32(1.0 / Pd),
+                     self.g2, self.mask)
+        # e2 is the frame-domain residual; carry it back to the entrance
+        # plane, undoing whatever _detector_spectrum applied
+        if self.pre is None:
+            self._fft(self.plan_frame, self.e2, self.rI, inverse=True)
+        else:
+            self._fft(self.plan_frame, self.e2, self.e1, inverse=True)
+            self._launch("mult_conj", self.MPd, self.pre, self.e1,
+                         self.rI, self.MPd, Pd)
         if pad:
-            # total is entrance-referred; carry it to the exit plane
-            # before cropping, because a crop does not commute with
-            # propagation
-            self.psi[...] = self.Hlast * self.total
-            self._fft(self.plan_grid, self.psi, self.Rf, inverse=True)
-            self.e1[...] = self.Rf[ctr]
-            if self.pre is not None:
-                self._launch("mult", self.MPd, self.pre, self.e1,
-                             self.e2, self.MPd, Pd)
-                self._fft(self.plan_frame, self.e2, self.e1)   # chirped D
-                self._launch("detector", Pd, self.e1, self.Idat, self.Imod,
-                             self.e2, Mp, Pd, np.float32(1.0 / Pd),
-                             self.g2, self.mask)
-                self._fft(self.plan_frame, self.e2, self.e1, inverse=True)
-                self._launch("mult_conj", self.MPd, self.pre, self.e1,
-                             self.rI, self.MPd, Pd)
-            else:
-                self._fft(self.plan_frame, self.e1, self.e2)   # frame spectrum
-                self._launch("detector", Pd, self.e2, self.Idat, self.Imod,
-                             self.e1, Mp, Pd, np.float32(1.0 / Pd),
-                             self.g2, self.mask)
-                self._fft(self.plan_frame, self.e1, self.rI, inverse=True)
-            # back to the entrance plane on the padded grid
             self.rpad.fill(0)
             self.rpad[ctr] = self.rI
             self._fft(self.plan_grid, self.rpad, self.psi)
             self.Rf[...] = self.Hlast_c * self.psi
         elif self.pre is None:
-            self._launch("detector", Pix, self.total, self.Idat,
-                         self.Imod, self.Rf, Mp, Pix,
-                         np.float32(1.0 / Pix), self.g2, self.mask)
-            self._fft(self.plan_grid, self.Rf, self.rI, inverse=True)
+            self.Rf[...] = self.e2          # already the Fourier residual
         else:
-            self._fft(self.plan_grid, self.total, self.e1, inverse=True)
-            self._launch("mult", MP, self.pre, self.e1, self.e2, MP, Pix)
-            self._fft(self.plan_grid, self.e2, self.e1)         # chirped D
-            self._launch("detector", Pix, self.e1, self.Idat,
-                         self.Imod, self.e2, Mp, Pix,
-                         np.float32(1.0 / Pix), self.g2, self.mask)
-            self._fft(self.plan_grid, self.e2, self.e1, inverse=True)
-            self._launch("mult_conj", MP, self.pre, self.e1, self.rI,
-                         MP, Pix)                               # r_field
             self._fft(self.plan_grid, self.rI, self.Rf)
 
         # adjoint orders
@@ -399,6 +458,85 @@ class BornCudaStep:
         self._launch("probe_grad", self.MPd, order0, self.tPI, self.gP,
                      self.MPd)
         self._launch("kp_kernel", Pd, self.O, self.KP, N, Pd)
+
+
+    # Line search. The order-M model is affine in a probe step at every
+    # order and affine in an object step at M = 1, so the detector field
+    # along the search line is psi + gamma*d and the model intensity is
+    # exactly quadratic in gamma.
+
+    def direction_object(self, d):
+        """Detector-frame spectrum of an object search direction, into
+        self.Dd. The scatter kernel forms O - 1, so passing d + 1 makes it
+        scatter d itself, and the unscattered term is dropped."""
+        self.Odir[...] = 1.0                # d vanishes outside the patch
+        self.Odir[self.ctr] = d + 1.0
+        if self.padded:
+            self.Prpad.fill(0)
+            self.Prpad[self.ctr] = self.Pr
+            Pr = self.Prpad
+        else:
+            Pr = self.Pr
+        self._forward(self.Odir, Pr, incident=False)
+        self._detector_spectrum(self.Dd)
+
+    def direction_probe(self, dP):
+        """Detector-frame spectrum of a probe search direction, into
+        self.Dd. The model is linear in the probe, so this is the model
+        itself evaluated at dP, incident term included."""
+        if self.padded:
+            self.Opad[self.ctr] = self.O
+            self.Prpad.fill(0)
+            self.Prpad[self.ctr] = dP
+            O, Pr = self.Opad, self.Prpad
+        else:
+            O, Pr = self.O, dP
+        self._forward(O, Pr, incident=True)
+        self._detector_spectrum(self.Dd)
+
+    def _line_coeffs(self):
+        """c0, c1, c2 of Imod(gamma) - Idat = c0 + gamma*c1 + gamma^2*c2,
+        summed over probe modes."""
+        k = self.g2[0] / np.float32(self.Pd)
+        Imod = k * (self.Dfld.real ** 2 + self.Dfld.imag ** 2).sum(axis=0)
+        c0 = Imod - self.Idat
+        c1 = 2.0 * k * (self.Dfld.conj() * self.Dd).real.sum(axis=0)
+        c2 = k * (self.Dd.real ** 2 + self.Dd.imag ** 2).sum(axis=0)
+        return Imod, c0, c1, c2
+
+    def line_search_gaussian(self, W):
+        """Exact step for the intensity Gaussian likelihood: the quartic
+        in gamma is minimised at a real root of its derivative cubic."""
+        _, c0, c1, c2 = self._line_coeffs()
+        self.A[...] = cp.stack([
+            (W * c0 * c0).sum(),
+            2.0 * (W * c0 * c1).sum(),
+            (W * (c1 * c1 + 2.0 * c0 * c2)).sum(),
+            2.0 * (W * c1 * c2).sum(),
+            (W * c2 * c2).sum()]).astype(cp.float64)
+        self._launch("ls_gamma", 1, self.A, self.gamma)
+        return self.gamma
+
+    def line_search_newton(self, w):
+        """One Newton step for the amplitude-l2 fidelity, whose dependence
+        on gamma has no closed-form minimiser. Imod(gamma) is still exactly
+        quadratic, so the derivatives at gamma = 0 are closed form."""
+        Imod, _, c1, c2 = self._line_coeffs()
+        Im = cp.maximum(Imod, 1e-12)
+        Jp = 1.0 - cp.sqrt(self.Idat / Im)
+        Jpp = 0.5 * cp.sqrt(self.Idat) * Im ** -1.5
+        L1 = (w * Jp * c1).sum()
+        L2 = (w * (Jpp * c1 * c1 + 2.0 * Jp * c2)).sum()
+        # a non-positive curvature has no minimiser; fall back to no step
+        self.gamma[0] = cp.where(L2 > 0, -L1 / cp.maximum(L2, 1e-30), 0.0)
+        return self.gamma
+
+    def advance(self, gamma, d):
+        """Take the object step: the detector field moves along the line
+        in closed form, so the probe search that follows needs no second
+        forward evaluation of the model."""
+        self.Dfld += gamma * self.Dd
+        self.O += gamma * d
 
 
 # Storage / output helpers

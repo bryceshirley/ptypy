@@ -23,7 +23,11 @@ import sys
 # so the repo they ship with is four levels up; run in place against it
 # and put this directory first so the demos can import each other.
 _HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.abspath(os.path.join(_HERE, *[os.pardir] * 4)))
+_REPO = _HERE
+while (_REPO != os.path.dirname(_REPO)
+       and not os.path.isdir(os.path.join(_REPO, "ptypy", "core"))):
+    _REPO = os.path.dirname(_REPO)
+sys.path.insert(0, _REPO)
 sys.path.insert(0, _HERE)
 
 import argparse

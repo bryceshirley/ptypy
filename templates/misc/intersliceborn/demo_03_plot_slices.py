@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """Render object slices in the style of the NanoMAX paper figure.
 
-Uses the shared notebook port in plotting.py and applies it to the
+Uses the figure code in demo_01_nanomax_engines.py and applies it to the
 centred-ISB reconstruction
 as well as to the published 500-iteration multislice reference, so the
 two are directly comparable with the published figure.
@@ -14,7 +14,7 @@ import os
 
 import numpy as np
 
-from plotting import load_slices, slice_figure
+from demo_01_nanomax_engines import load_slices, slice_figure
 
 # Results live beside the template, not in whatever directory the demo
 # was launched from, so a relative --out always resolves here.

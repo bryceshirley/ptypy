@@ -41,17 +41,14 @@ index, because the index ordering is not stable.
 
 ## Plotting
 
-`plotting.py` is the shared figure code: a port of
-`data/nanomax/notebooks/Figure_reconstruction_result.ipynb` — crop 512
-off every border, unwrap, subtract the offset measured in a vacuum
-window, Greys_r on [-1.2, 0.1] rad, micrometre extent, red zoom box and
-scale bars. Keeping the notebook's constants means any demo's output
-can be laid next to the published figure and compared directly.
-
-It is also runnable, and renders every reconstruction in a run
-directory:
-
-    python plotting.py results/demo_01
+The figure code lives in `demo_01_nanomax_engines.py`: a port of
+`data/nanomax/notebooks/Figure_reconstruction_result.ipynb` (crop 512 off
+every border, unwrap, subtract the offset measured in a vacuum window,
+Greys_r on [-1.2, 0.1] rad, micrometre extent, red zoom box and scale
+bars). Keeping the notebook's constants means any demo's output can be
+laid next to the published figure and compared directly. Demo 01 writes
+one figure per engine plus `demo_01_born_vs_multislice.png`, the
+first-Born and multislice reconstructions side by side.
 
 - `demo_03_plot_slices.py` — the same figure for demo 03's output, next
   to the published 500-iteration multislice reference, with the
